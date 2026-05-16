@@ -17,8 +17,8 @@ import {
 	CardTitle,
 } from "../components/ui/card.tsx";
 import { Skeleton } from "../components/ui/skeleton.tsx";
-import { formatAbsolute, formatDuration } from "../lib/format.ts";
-import { sourceBadgeVariant } from "../lib/source-badge.ts";
+import { formatAbsolute, formatDuration } from "../format.ts";
+import { sourceBadgeVariant } from "../source-badge.ts";
 
 export interface ConversationsListProps {
 	/** Optional `agentId` filter passed through as `?agentId=` to the server. */
@@ -159,7 +159,7 @@ function ConversationRow({ session, onSelect }: ConversationRowProps) {
 				<button
 					type="button"
 					onClick={() => onSelect(session.id)}
-					aria-label={`Open session ${session.id}`}
+					aria-label={`Open session ${session.agentId}, started ${formatAbsolute(session.startedAt)}`}
 					className="block w-full cursor-pointer text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 rounded-xl"
 				>
 					{inner}
@@ -199,7 +199,7 @@ interface ErrorStateProps {
 
 function ErrorState({ error, onRetry }: ErrorStateProps) {
 	return (
-		<Card>
+		<Card role="alert">
 			<CardHeader>
 				<CardTitle className="flex items-center gap-2 text-base">
 					<AlertCircle className="text-destructive size-4" />
@@ -207,7 +207,7 @@ function ErrorState({ error, onRetry }: ErrorStateProps) {
 				</CardTitle>
 				<CardDescription className="break-all">{error.message}</CardDescription>
 			</CardHeader>
-			<CardContent role="alert" className="flex justify-end">
+			<CardContent className="flex justify-end">
 				<Button size="sm" variant="outline" onClick={onRetry}>
 					Try again
 				</Button>

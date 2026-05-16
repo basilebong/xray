@@ -12,10 +12,11 @@ export interface FetchConversationParams {
 }
 
 /**
- * Single network call to `GET /v1/sessions/:id`. Pure function — no React,
- * no state. `useQuery` wraps this; tests call it directly. Validates the
- * response against the server-emitted schema at the boundary per
- * `.claude/rules/boundary-validation.md` §2.
+ * Single network call to `GET /v1/sessions/:id`.
+ *
+ * Throws `ConversationLoadError` on non-2xx and
+ * `ConversationInvalidResponseError` when the body doesn't match
+ * `ConversationSchema`.
  */
 export async function fetchConversation({
 	sessionId,

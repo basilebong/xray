@@ -274,4 +274,15 @@ describe("GET /v1/sessions/:id — error paths", () => {
 		);
 		expect(res.status).toBe(400);
 	});
+
+	it("returns 500 with a generic body for a data-integrity failure (adapter row with null provider)", async () => {
+		// `getConversationForApi` throws InconsistentSessionRowError when source='adapter'
+		// but provider=null. The router maps it to 500 explicitly — proves the data-
+		// integrity arm of the onError match is reachable.
+		saveSession(store.db, makeSession({ id: "broken", source: "adapter", provider: null }));
+		const res = await app.request(makeGetConversationRequest("broken"));
+		expect(res.status).toBe(500);
+		const body = v.parse(v.object({ error: v.literal("store_failure") }), await res.json());
+		expect(body.error).toBe("store_failure");
+	});
 });

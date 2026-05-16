@@ -157,7 +157,9 @@ describe("ConversationsList — selection", () => {
 				<ConversationsList apiBase="http://localhost" onSelectSession={onSelectSession} />,
 			),
 		);
-		const row = await screen.findByRole("button", { name: /open session sess-8/i });
+		// aria-label is "Open session <agentId>, started <timestamp>" — pair the
+		// agent name with a started-at fragment so SR users hear context, not a UUID.
+		const row = await screen.findByRole("button", { name: /open session agent-8, started/i });
 		fireEvent.click(row);
 		expect(onSelectSession).toHaveBeenCalledWith("sess-8");
 	});

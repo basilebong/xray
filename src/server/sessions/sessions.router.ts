@@ -7,6 +7,8 @@ import { sanitizeIssues } from "@/server/sanitize-issues/sanitize-issues.ts";
 import type { Store } from "@/server/store/store.ts";
 
 import {
+	CorruptToolCallJsonError,
+	InconsistentSessionRowError,
 	InvalidQueryError,
 	InvalidSessionIdError,
 	SessionNotFoundError,
@@ -54,9 +56,20 @@ export function createSessionsRouter(store: Store): Hono {
 			.with(P.instanceOf(SessionNotFoundError), (e) =>
 				c.json({ error: "session_not_found", sessionId: e.sessionId }, 404),
 			)
+			.with(
+				P.union(P.instanceOf(InconsistentSessionRowError), P.instanceOf(CorruptToolCallJsonError)),
+				(e) => {
+					// Both are data-integrity failures the writers cannot produce — log
+					// and 500 so an operator notices, instead of leaking the typed
+					// payload to a client that can't act on it.
+					console.error("data integrity failure in sessions router", e);
+					return c.json({ error: "store_failure" }, 500);
+				},
+			)
+			// `.otherwise` re-throws per pattern-matching.md §1 — an unknown error
+			// here isn't ours to map, so Hono's default handler emits a 500.
 			.otherwise((e) => {
-				console.error("unhandled error in sessions router", e);
-				return c.json({ error: "store_failure" }, 500);
+				throw e;
 			}),
 	);
 

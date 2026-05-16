@@ -20,8 +20,8 @@ import {
 } from "../components/ui/card.tsx";
 import { Separator } from "../components/ui/separator.tsx";
 import { Skeleton } from "../components/ui/skeleton.tsx";
-import { formatAbsolute, formatDuration } from "../lib/format.ts";
-import { sourceBadgeVariant } from "../lib/source-badge.ts";
+import { formatAbsolute, formatDuration } from "../format.ts";
+import { sourceBadgeVariant } from "../source-badge.ts";
 import { ConversationLoadError } from "./errors.ts";
 
 export interface InspectorProps {
@@ -46,18 +46,28 @@ export function Inspector({ sessionId, apiBase, onBack }: InspectorProps) {
 	});
 
 	return (
-		<section aria-label="Transcript" aria-busy={query.isPending} className="space-y-6">
-			<header className="flex items-baseline justify-between gap-4">
-				{onBack && (
+		<section
+			aria-label="Transcript"
+			aria-busy={query.isPending}
+			aria-live="polite"
+			className="space-y-6"
+		>
+			{onBack && (
+				<header className="flex items-baseline justify-between gap-4">
 					<Button variant="ghost" size="sm" onClick={onBack}>
 						<ArrowLeft />
 						All sessions
 					</Button>
-				)}
-			</header>
+				</header>
+			)}
 
 			{match(query)
-				.with({ status: "pending" }, () => <LoadingState />)
+				.with({ status: "pending" }, () => (
+					<>
+						<span className="sr-only">Loading transcript…</span>
+						<LoadingState />
+					</>
+				))
 				.with({ status: "error" }, (q) => (
 					<ErrorState error={q.error} onRetry={() => query.refetch()} />
 				))
@@ -208,7 +218,7 @@ function ToolCallField({ label, value }: { label: string; value: unknown }) {
 
 function LoadingState() {
 	return (
-		<div className="space-y-4">
+		<div className="space-y-4" aria-hidden="true">
 			<Skeleton className="h-7 w-48" />
 			<Skeleton className="h-4 w-72" />
 			<Separator />
@@ -232,21 +242,27 @@ interface ErrorStateProps {
 function ErrorState({ error, onRetry }: ErrorStateProps) {
 	const notFound = error instanceof ConversationLoadError && error.status === 404;
 	return (
-		<Card>
+		// role="alert" on the whole card so SR announces title + description
+		// together when the error mounts — not just the retry footer.
+		<Card role="alert">
 			<CardHeader>
 				<CardTitle className="flex items-center gap-2 text-base">
 					<AlertCircle className="text-destructive size-4" />
 					{notFound ? "Session not found." : "Failed to load transcript."}
 				</CardTitle>
-				<CardDescription className="break-all">{error.message}</CardDescription>
+				<CardDescription className="break-all">
+					{notFound
+						? "The session id may have been removed or never existed. Go back to the list and pick another."
+						: error.message}
+				</CardDescription>
 			</CardHeader>
-			<CardContent role="alert" className="flex justify-end">
-				{!notFound && (
+			{!notFound && (
+				<CardContent className="flex justify-end">
 					<Button size="sm" variant="outline" onClick={onRetry}>
 						Try again
 					</Button>
-				)}
-			</CardContent>
+				</CardContent>
+			)}
 		</Card>
 	);
 }
