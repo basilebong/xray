@@ -33,6 +33,7 @@ export function makeToolCalledEvent(overrides: Partial<ToolCalledEvent> = {}): T
 	return {
 		type: "tool_called",
 		turnIdx: 0,
+		idx: 0,
 		name: "lookup",
 		args: { q: "hello" },
 		...overrides,

@@ -1,6 +1,6 @@
 import { ensureStubSession, markSessionEnded, saveSession } from "@/server/store/sessions-repo.ts";
 import type { Store } from "@/server/store/store.ts";
-import { appendToolCalls, countToolCallsForTurn } from "@/server/store/tool-calls-repo.ts";
+import { appendToolCallIdempotent } from "@/server/store/tool-calls-repo.ts";
 import { appendTurnIdempotent, getTurnByIdx } from "@/server/store/turns-repo.ts";
 
 import { UnknownTurnError } from "./ingest.errors.ts";
@@ -46,26 +46,30 @@ export function applyEvent(store: Store, sessionId: string, event: IngestEvent):
 			return;
 
 		case "tool_called": {
-			ensureStubSession(db, sessionId, new Date().toISOString());
+			// No `ensureStubSession` here: the `turns.session_id` FK guarantees
+			// the session exists whenever a turn exists, so the lookup below
+			// is sufficient.
 			const turn = getTurnByIdx(db, sessionId, event.turnIdx);
 			if (!turn) {
 				throw new UnknownTurnError(sessionId, event.turnIdx);
 			}
-			appendToolCalls(db, turn.id, [
-				{
-					idx: countToolCallsForTurn(db, turn.id),
-					name: event.name,
-					argsJson: JSON.stringify(event.args ?? null),
-					resultJson: event.result === undefined ? null : JSON.stringify(event.result),
-					latencyMs: event.latencyMs ?? null,
-				},
-			]);
+			appendToolCallIdempotent(db, turn.id, {
+				idx: event.idx,
+				name: event.name,
+				argsJson: JSON.stringify(event.args ?? null),
+				resultJson: event.result === undefined ? null : JSON.stringify(event.result),
+				latencyMs: event.latencyMs ?? null,
+			});
 			return;
 		}
 
 		case "session_ended":
 			ensureStubSession(db, sessionId, event.endedAt);
 			markSessionEnded(db, sessionId, event.endedAt, event.durationMs);
+			return;
+
+		default:
+			event satisfies never;
 			return;
 	}
 }

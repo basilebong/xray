@@ -152,6 +152,16 @@ describe("POST /v1/sessions/:id/events — schema rejection", () => {
 		expect(res.status).toBe(400);
 	});
 
+	it("returns 400 for a non-ISO 8601 timestamp", async () => {
+		const badBody: unknown = {
+			type: "session_started",
+			agentId: "agent-1",
+			startedAt: "tomorrow at noon",
+		};
+		const res = await post("sess-A", badBody);
+		expect(res.status).toBe(400);
+	});
+
 	it("returns 400 for a non-JSON body", async () => {
 		const req = new Request("http://test.local/v1/sessions/sess-A/events", {
 			method: "POST",
@@ -172,6 +182,20 @@ describe("POST /v1/sessions/:id/events — idempotency", () => {
 		expect(r1.status).toBe(200);
 		expect(r2.status).toBe(200);
 		expect(listTurnsForSession(store.db, "sess-A")).toHaveLength(1);
+	});
+
+	it("re-POSTing the same tool_called is a no-op (no duplicate row)", async () => {
+		await post("sess-A", makeSessionStartedEvent());
+		await post("sess-A", makeTurnCompletedEvent({ idx: 0, role: "agent" }));
+		const evt = makeToolCalledEvent({ turnIdx: 0, idx: 0, name: "lookup" });
+		const r1 = await post("sess-A", evt);
+		const r2 = await post("sess-A", evt);
+		expect(r1.status).toBe(200);
+		expect(r2.status).toBe(200);
+		const [turn] = listTurnsForSession(store.db, "sess-A");
+		expect(turn).toBeDefined();
+		if (!turn) return;
+		expect(listToolCallsForTurn(store.db, turn.id)).toHaveLength(1);
 	});
 });
 

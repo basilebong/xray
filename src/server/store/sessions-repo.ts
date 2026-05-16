@@ -1,4 +1,4 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 
 import type { AgentId } from "@/adapters/types.ts";
 
@@ -11,11 +11,17 @@ import type { Session, SessionSource } from "./types.ts";
  * polls may re-emit the same session id with updated `endedAt`) and ingest
  * (where `session_started` and a later `session_ended` arrive separately).
  *
- * `endedAt` and `durationMs` are **sticky**: once set, a later write with a
- * null value won't unset them. A session that has ended cannot un-end, so
- * an out-of-order poll returning an in-progress snapshot must not regress
- * the canonical end time. Other columns use last-writer-wins — adapters
- * don't change them in practice.
+ * Stickiness rules on upsert:
+ * - `startedAt` is **MIN-merged**: a stub (created on first turn with
+ *   `startedAt = turn.ts`) must not be pushed forward by a later
+ *   `session_started` whose own startedAt is past an already-recorded
+ *   turn. `MIN(...)` keeps `startedAt <= min(turn.ts)` as an invariant.
+ * - `endedAt` / `durationMs` are sticky via `COALESCE`: once set, a later
+ *   write with a null value won't unset them. A session that has ended
+ *   cannot un-end.
+ *
+ * Other columns use last-writer-wins — adapters don't change them in
+ * practice.
  */
 export function saveSession(db: StoreDb, session: Session): void {
 	db.insert(sessions)
@@ -26,7 +32,7 @@ export function saveSession(db: StoreDb, session: Session): void {
 				source: sql`excluded.source`,
 				provider: sql`excluded.provider`,
 				agentId: sql`excluded.agent_id`,
-				startedAt: sql`excluded.started_at`,
+				startedAt: sql`MIN(excluded.started_at, ${sessions.startedAt})`,
 				endedAt: sql`COALESCE(excluded.ended_at, ${sessions.endedAt})`,
 				durationMs: sql`COALESCE(excluded.duration_ms, ${sessions.durationMs})`,
 			},
@@ -55,14 +61,22 @@ export function ensureStubSession(db: StoreDb, id: string, startedAt: string): v
 		.run();
 }
 
-/** Stamp end-of-session metadata. No-op if `id` does not exist. */
+/**
+ * Stamp end-of-session metadata. No-op if `id` does not exist, AND no-op
+ * if the session already has an `endedAt` — once a session has ended it
+ * cannot un-end, and a retried `session_ended` must not overwrite the
+ * canonical end time.
+ */
 export function markSessionEnded(
 	db: StoreDb,
 	id: string,
 	endedAt: string,
 	durationMs: number,
 ): void {
-	db.update(sessions).set({ endedAt, durationMs }).where(eq(sessions.id, id)).run();
+	db.update(sessions)
+		.set({ endedAt, durationMs })
+		.where(and(eq(sessions.id, id), isNull(sessions.endedAt)))
+		.run();
 }
 
 export function getSession(db: StoreDb, id: string): Session | undefined {

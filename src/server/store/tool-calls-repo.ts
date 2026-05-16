@@ -1,4 +1,4 @@
-import { asc, eq, sql } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 
 import { toolCalls } from "./schema.ts";
 import type { StoreDb } from "./store.ts";
@@ -17,6 +17,18 @@ export function appendToolCalls(db: StoreDb, turnId: string, batch: ToolCallInpu
 	});
 }
 
+/**
+ * Append one tool call. On `UNIQUE(turn_id, idx)` collision the insert is
+ * silently dropped — the ingest path's idempotency contract: replaying the
+ * same `(turn_id, idx)` is a no-op.
+ */
+export function appendToolCallIdempotent(db: StoreDb, turnId: string, call: ToolCallInput): void {
+	db.insert(toolCalls)
+		.values({ ...call, turnId })
+		.onConflictDoNothing({ target: [toolCalls.turnId, toolCalls.idx] })
+		.run();
+}
+
 export function listToolCallsForTurn(db: StoreDb, turnId: string): ToolCallRow[] {
 	return db
 		.select()
@@ -24,17 +36,4 @@ export function listToolCallsForTurn(db: StoreDb, turnId: string): ToolCallRow[]
 		.where(eq(toolCalls.turnId, turnId))
 		.orderBy(asc(toolCalls.idx))
 		.all();
-}
-
-/**
- * Count tool calls already attached to a turn. The ingest path uses this to
- * pick the next `idx` without materializing the full row list.
- */
-export function countToolCallsForTurn(db: StoreDb, turnId: string): number {
-	const row = db
-		.select({ n: sql<number>`count(*)` })
-		.from(toolCalls)
-		.where(eq(toolCalls.turnId, turnId))
-		.get();
-	return row?.n ?? 0;
 }

@@ -9,13 +9,16 @@ import { IngestEventSchema } from "./ingest.types.ts";
 
 /**
  * HTTP ingest router. Mounted at `/v1`; final URL is
- * `POST /v1/sessions/:id/events`. Localhost-only — no auth.
+ * `POST /v1/sessions/:id/events`.
+ *
+ * **No authentication.** Network exposure is the operator's responsibility:
+ * default bind is `0.0.0.0` (set `HOST=127.0.0.1` for single-host self-hosting
+ * or front with an auth-checking reverse proxy).
  *
  * Idempotency: replaying any event with the same identity key
- * (`session_id` + `idx` for turns; `session_id` for session_started /
- * session_ended) is a no-op. Second POST never duplicates a row. The
- * idempotency guarantee itself lives in `ingest.service.ts`; this file
- * is HTTP plumbing only.
+ * (`session_id` + `idx` for turns and tool calls; `session_id` for
+ * session_started / session_ended) is a no-op. Idempotency lives in
+ * `ingest.service.ts`; this file is HTTP plumbing only.
  */
 export function createIngestRouter(store: Store): Hono {
 	const router = new Hono();
