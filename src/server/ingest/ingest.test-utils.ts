@@ -3,7 +3,7 @@ import type {
 	SessionStartedEvent,
 	ToolCalledEvent,
 	TurnCompletedEvent,
-} from "./types.ts";
+} from "./ingest.types.ts";
 
 export function makeSessionStartedEvent(
 	overrides: Partial<SessionStartedEvent> = {},

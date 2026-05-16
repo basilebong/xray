@@ -13,7 +13,7 @@ import {
 	makeSessionStartedEvent,
 	makeToolCalledEvent,
 	makeTurnCompletedEvent,
-} from "./test-utils.ts";
+} from "./ingest.test-utils.ts";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 
 const InvalidEventBodySchema = v.object({

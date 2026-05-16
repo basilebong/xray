@@ -1,6 +1,6 @@
 import * as v from "valibot";
 
-import { IngestError, InvalidEventError, UnknownTurnError } from "./errors.ts";
+import { IngestError, InvalidEventError, UnknownTurnError } from "./ingest.errors.ts";
 import { describe, expect, it } from "bun:test";
 
 describe("IngestError", () => {

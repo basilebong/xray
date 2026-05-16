@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 
 import { healthz } from "./healthz/healthz.ts";
-import { createIngestRouter } from "./ingest/ingest.ts";
+import { createIngestRouter } from "./ingest/ingest.router.ts";
 import type { Store } from "./store/store.ts";
 
 export function createApp(store: Store): Hono {
