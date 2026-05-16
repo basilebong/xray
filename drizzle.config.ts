@@ -13,6 +13,6 @@ export default defineConfig({
 	schema: "./src/server/store/schema.ts",
 	out: "./src/server/store/migrations",
 	dbCredentials: {
-		url: "./data/xray.db",
+		url: `${process.env.XRAY_DATA_DIR ?? "./data"}/xray.db`,
 	},
 });

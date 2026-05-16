@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 
 import type { AgentId } from "@/adapters/types.ts";
 
@@ -10,6 +10,12 @@ import type { Session, SessionSource } from "./types.ts";
  * Insert or replace a session by primary key. Used by both adapters (whose
  * polls may re-emit the same session id with updated `endedAt`) and ingest
  * (where `session_started` and a later `session_ended` arrive separately).
+ *
+ * `endedAt` and `durationMs` are **sticky**: once set, a later write with a
+ * null value won't unset them. A session that has ended cannot un-end, so
+ * an out-of-order poll returning an in-progress snapshot must not regress
+ * the canonical end time. Other columns use last-writer-wins — adapters
+ * don't change them in practice.
  */
 export function saveSession(db: StoreDb, session: Session): void {
 	db.insert(sessions)
@@ -17,12 +23,12 @@ export function saveSession(db: StoreDb, session: Session): void {
 		.onConflictDoUpdate({
 			target: sessions.id,
 			set: {
-				source: session.source,
-				provider: session.provider,
-				agentId: session.agentId,
-				startedAt: session.startedAt,
-				endedAt: session.endedAt,
-				durationMs: session.durationMs,
+				source: sql`excluded.source`,
+				provider: sql`excluded.provider`,
+				agentId: sql`excluded.agent_id`,
+				startedAt: sql`excluded.started_at`,
+				endedAt: sql`COALESCE(excluded.ended_at, ${sessions.endedAt})`,
+				durationMs: sql`COALESCE(excluded.duration_ms, ${sessions.durationMs})`,
 			},
 		})
 		.run();

@@ -1,13 +1,16 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { eq, sql } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { makeEnv } from "@/server/env/test-utils.ts";
+
+import { StoreParentDirNotFoundError } from "./errors.ts";
 import { sessions, toolCalls, turns } from "./schema.ts";
 import { saveSession } from "./sessions-repo.ts";
-import { openStore } from "./store.ts";
+import { openStore, openStoreFromEnv } from "./store.ts";
 import { makeSession } from "./test-utils.ts";
 
 interface PragmaRow {
@@ -67,6 +70,11 @@ describe("openStore", () => {
 		second.close();
 	});
 
+	it("throws StoreParentDirNotFoundError when the parent dir is missing", () => {
+		const missing = join(tmpDir, "does-not-exist", "xray.db");
+		expect(() => openStore({ path: missing })).toThrow(StoreParentDirNotFoundError);
+	});
+
 	it("cascades session deletes to turns and tool_calls", () => {
 		const store = openStore({ path: ":memory:" });
 		saveSession(store.db, makeSession({ id: "cascade-me" }));
@@ -91,5 +99,27 @@ describe("openStore", () => {
 		expect(store.db.select().from(turns).all()).toEqual([]);
 		expect(store.db.select().from(toolCalls).all()).toEqual([]);
 		store.close();
+	});
+});
+
+describe("openStoreFromEnv", () => {
+	it("creates XRAY_DATA_DIR if missing and opens xray.db inside it", () => {
+		const dataDir = join(tmpDir, "fresh-data-dir");
+		expect(existsSync(dataDir)).toBe(false);
+		const store = openStoreFromEnv(makeEnv({ XRAY_DATA_DIR: dataDir }));
+		expect(existsSync(join(dataDir, "xray.db"))).toBe(true);
+		store.close();
+	});
+
+	it("is idempotent when the dir and db file already exist", () => {
+		const env = makeEnv({ XRAY_DATA_DIR: join(tmpDir, "existing-data-dir") });
+		const first = openStoreFromEnv(env);
+		saveSession(first.db, makeSession({ id: "persist-me" }));
+		first.close();
+
+		const second = openStoreFromEnv(env);
+		const row = second.db.select().from(sessions).where(eq(sessions.id, "persist-me")).get();
+		expect(row?.id).toBe("persist-me");
+		second.close();
 	});
 });

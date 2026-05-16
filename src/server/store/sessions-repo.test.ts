@@ -28,6 +28,19 @@ describe("sessions-repo", () => {
 		store.close();
 	});
 
+	it("does not un-end a previously-ended session", () => {
+		const store = makeTempStore();
+		saveSession(
+			store.db,
+			makeSession({ id: "s-1", endedAt: "2026-05-16T13:00:00.000Z", durationMs: 300_000 }),
+		);
+		saveSession(store.db, makeSession({ id: "s-1", endedAt: null, durationMs: null }));
+		const row = getSession(store.db, "s-1");
+		expect(row?.endedAt).toBe("2026-05-16T13:00:00.000Z");
+		expect(row?.durationMs).toBe(300_000);
+		store.close();
+	});
+
 	it("returns undefined for unknown id", () => {
 		const store = makeTempStore();
 		expect(getSession(store.db, "missing")).toBeUndefined();
