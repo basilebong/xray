@@ -118,6 +118,12 @@ jobs:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
+          # Don't auto-attach the SBOM as a GitHub Release asset — that needs
+          # `contents: write` and we only grant `contents: read` (default-min
+          # per supply-chain.md). The canonical attestation path is the
+          # `actions/attest-sbom` step below, which pushes the SBOM to GHCR
+          # as an OCI artifact and doesn't touch the Release.
+          upload-release-assets: false
 
       - name: Attest SBOM
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e  # v4.1.0
