@@ -17,10 +17,14 @@
 //   5. For each `user_audio.append` from xray, appends to OpenAI's
 //      `input_audio_buffer.append`. On `user_audio.commit`, commits the
 //      buffer and triggers `response.create`.
-//   6. As OpenAI streams `response.audio.delta` /
-//      `response.audio_transcript.delta` back, relays them to xray as
-//      `agent_audio.delta` / `agent_transcript.delta`. On `response.done`,
-//      sends `turn.done`.
+//   6. As OpenAI streams `response.output_audio.delta` /
+//      `response.output_audio_transcript.delta` back, buffers raw PCM and
+//      relays transcript deltas to xray. On `response.done`, flushes one
+//      wrapped WAV `agent_audio.delta` then sends `turn.done`. When the
+//      model responds with a function call instead of audio, the first
+//      `response.done` is skipped (it's the function-call leg); the
+//      follow-up response.done after our `function_call_output` injection
+//      is the actual turn boundary.
 //   7. When OpenAI emits `response.function_call_arguments.done`, looks up
 //      the recorded result by tool name and `conversation.item.create`s a
 //      `function_call_output` back to OpenAI, then re-triggers
@@ -125,6 +129,11 @@ interface PerSocketState {
 	 *  unplayable — most decoders honor the first chunk's `data` length and
 	 *  stop there. One header + concatenated PCM is the only correct shape. */
 	pcmChunks: Uint8Array[];
+	/** True once we've sent a `conversation.item.create` (function_call_output)
+	 *  + `response.create` and are waiting on the model's follow-up response.
+	 *  The first `response.done` for a function-call-only response is NOT a
+	 *  turn boundary; the follow-up's `response.done` is. */
+	expectingFollowupResponse: boolean;
 }
 
 function freshState(): PerSocketState {
@@ -136,6 +145,7 @@ function freshState(): PerSocketState {
 		transcriptAccumulator: "",
 		lastTurnStartedAtMs: null,
 		pcmChunks: [],
+		expectingFollowupResponse: false,
 	};
 }
 
@@ -442,12 +452,16 @@ function openUpstream(
  * instead of a silent `String(undefined)` later. Unknown events fall through
  * the variant and are ignored.
  */
+// GA renamed `response.audio.delta` → `response.output_audio.delta` and
+// `response.audio_transcript.delta` → `response.output_audio_transcript.delta`.
+// Pre-rename schemas silently dropped every chunk (the source of the
+// "replay produced no audio and no transcript" symptom).
 const UpstreamAudioDelta = v.object({
-	type: v.literal("response.audio.delta"),
+	type: v.literal("response.output_audio.delta"),
 	delta: v.string(),
 });
 const UpstreamTranscriptDelta = v.object({
-	type: v.literal("response.audio_transcript.delta"),
+	type: v.literal("response.output_audio_transcript.delta"),
 	delta: v.string(),
 });
 const UpstreamFunctionCallDone = v.object({
@@ -494,12 +508,12 @@ function handleUpstreamEvent(
 		if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
 	};
 	match(parsed.output)
-		.with({ type: "response.audio.delta" }, (e) => {
+		.with({ type: "response.output_audio.delta" }, (e) => {
 			// Buffer raw PCM only — the WAV header is prepended once at
 			// turn.done so the engine writes a single playable file.
 			ws.data.pcmChunks.push(new Uint8Array(Buffer.from(e.delta, "base64")));
 		})
-		.with({ type: "response.audio_transcript.delta" }, (e) => {
+		.with({ type: "response.output_audio_transcript.delta" }, (e) => {
 			ws.data.transcriptAccumulator += e.delta;
 			sendFrame({ type: "agent_transcript.delta", turnIdx, text: e.delta });
 		})
@@ -517,6 +531,10 @@ function handleUpstreamEvent(
 					}),
 				);
 				upstream.send(JSON.stringify({ type: "response.create" }));
+				// The follow-up response carries the actual audio + transcript;
+				// do not treat the function-call response's `response.done`
+				// as the turn boundary.
+				ws.data.expectingFollowupResponse = true;
 			}
 			sendFrame({
 				type: "tool_called",
@@ -528,6 +546,13 @@ function handleUpstreamEvent(
 			});
 		})
 		.with({ type: "response.done" }, () => {
+			if (ws.data.expectingFollowupResponse) {
+				// This `response.done` was for the function-call leg; keep the
+				// turn state open for the model's audio reply that follows
+				// our `function_call_output` injection.
+				ws.data.expectingFollowupResponse = false;
+				return;
+			}
 			const totalPcm = ws.data.pcmChunks.reduce((n, c) => n + c.byteLength, 0);
 			if (totalPcm > 0) {
 				const merged = new Uint8Array(totalPcm);
@@ -562,14 +587,6 @@ function handleUpstreamEvent(
 			const param = e.error?.param;
 			const detail =
 				param !== undefined && param !== null ? `${message} (param=${param})` : message;
-			// Race-with-auto-create: GA may auto-create a response from
-			// `input_audio_buffer.commit` AND honor our explicit
-			// `response.create`. Whichever loses fires this error; the winner
-			// runs to `response.done` normally. Log and keep listening.
-			if (code === "conversation_already_has_active_response") {
-				console.warn(`[upstream] benign race: ${detail} — continuing on the active response`);
-				return;
-			}
 			sendError(ws, code, detail);
 			ws.close(1011, code);
 			upstream.close(1000, "client closed");
