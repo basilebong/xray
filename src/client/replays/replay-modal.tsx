@@ -1,8 +1,9 @@
 import { useMutation } from "@tanstack/react-query";
 import { AlertCircle, Loader2 } from "lucide-react";
 import { useId, useState } from "react";
+import { match } from "ts-pattern";
 
-import type { ReplayRunResponse } from "@/server/replays/replays.types.ts";
+import type { ReplayMode, ReplayRunResponse } from "@/server/replays/replays.types.ts";
 
 import { createReplay } from "../api/replays-api.ts";
 import { Button } from "../components/ui/button.tsx";
@@ -24,32 +25,68 @@ export interface ReplayModalProps {
 // Webhook URLs may carry auth tokens in query params; localStorage is readable
 // by any script on this origin. xray is self-hosted single-user so this is
 // acceptable, but worth knowing if you embed xray elsewhere.
-const WEBHOOK_STORAGE_KEY = "xray.replay.webhookUrl";
+const WEBHOOK_STORAGE_KEYS: Record<ReplayMode, string> = {
+	text: "xray.replay.webhookUrl",
+	realtime: "xray.replay.realtimeWebhookUrl",
+};
 
-function readWebhookFromStorage(): string {
+function readWebhookFromStorage(mode: ReplayMode): string {
 	try {
-		return window.localStorage.getItem(WEBHOOK_STORAGE_KEY) ?? "";
+		return window.localStorage.getItem(WEBHOOK_STORAGE_KEYS[mode]) ?? "";
 	} catch {
 		return "";
 	}
 }
 
-function writeWebhookToStorage(url: string): void {
+function writeWebhookToStorage(mode: ReplayMode, url: string): void {
 	try {
-		window.localStorage.setItem(WEBHOOK_STORAGE_KEY, url);
+		window.localStorage.setItem(WEBHOOK_STORAGE_KEYS[mode], url);
 	} catch {
 		// ignore — form just won't autofill next time
 	}
 }
 
+function placeholderForMode(mode: ReplayMode): string {
+	return match(mode)
+		.with("text", () => "https://your-agent.example.com/replay")
+		.with("realtime", () => "ws://your-agent-realtime.example.com/")
+		.exhaustive();
+}
+
+function helpTextForMode(mode: ReplayMode): React.ReactNode {
+	return match(mode)
+		.with("text", () => (
+			<>
+				xray POSTs <code className="font-mono">{`{userText, history, recordedToolResults}`}</code>{" "}
+				per turn and expects <code className="font-mono">{`{agentText, toolCalls?, ...}`}</code>{" "}
+				back.
+			</>
+		))
+		.with("realtime", () => (
+			<>
+				xray opens one WebSocket per run, streams the source session's recorded audio, and writes
+				the agent's audio + transcript per turn boundary. Webhook is responsible for bridging to
+				OpenAI Realtime (or any V2V model).
+			</>
+		))
+		.exhaustive();
+}
+
 export function ReplayModal({ sourceSessionId, onClose, onStarted }: ReplayModalProps) {
 	const urlInputId = useId();
-	const [webhookUrl, setWebhookUrl] = useState<string>(readWebhookFromStorage);
+	const modeRadioName = useId();
+	const [mode, setMode] = useState<ReplayMode>("text");
+	const [webhookUrl, setWebhookUrl] = useState<string>(() => readWebhookFromStorage("text"));
+
+	const onModeChange = (next: ReplayMode): void => {
+		setMode(next);
+		setWebhookUrl(readWebhookFromStorage(next));
+	};
 
 	const mutation = useMutation<ReplayRunResponse, Error, void>({
-		mutationFn: () => createReplay({ body: { sourceSessionId, webhookUrl } }),
+		mutationFn: () => createReplay({ body: { sourceSessionId, webhookUrl }, mode }),
 		onSuccess: (run) => {
-			writeWebhookToStorage(webhookUrl);
+			writeWebhookToStorage(mode, webhookUrl);
 			onStarted(run);
 		},
 	});
@@ -65,31 +102,55 @@ export function ReplayModal({ sourceSessionId, onClose, onStarted }: ReplayModal
 				<DialogHeader>
 					<DialogTitle>Replay session</DialogTitle>
 					<DialogDescription>
-						xray walks the user-side inputs through your webhook and records the responses as a new
-						session. <span className="font-mono text-xs">{sourceSessionId}</span>
+						xray walks the source through your webhook and records the responses as a new session.{" "}
+						<span className="font-mono text-xs">{sourceSessionId}</span>
 					</DialogDescription>
 				</DialogHeader>
 
 				<form onSubmit={submit} className="space-y-5">
+					<fieldset className="space-y-2">
+						<legend className="text-sm font-medium">Mode</legend>
+						<div className="flex gap-3" role="radiogroup" aria-label="Replay mode">
+							<ModeOption
+								id={`${modeRadioName}-text`}
+								name={modeRadioName}
+								value="text"
+								checked={mode === "text"}
+								onChange={onModeChange}
+								label="Text (HTTP)"
+								hint="Per-turn POST"
+							/>
+							<ModeOption
+								id={`${modeRadioName}-realtime`}
+								name={modeRadioName}
+								value="realtime"
+								checked={mode === "realtime"}
+								onChange={onModeChange}
+								label="Realtime (V2V)"
+								hint="One WebSocket, audio in/out"
+							/>
+						</div>
+					</fieldset>
+
 					<div className="space-y-2">
 						<label htmlFor={urlInputId} className="text-sm font-medium">
 							Webhook URL
 						</label>
 						<input
 							id={urlInputId}
-							type="url"
+							// `type="text"` (not "url") because realtime URLs use the ws/wss
+							// scheme which the browser's built-in url validation rejects.
+							// Server-side Valibot is the authoritative validator at the
+							// boundary per .claude/rules/boundary-validation.md.
+							type="text"
 							required
 							autoFocus
-							placeholder="https://your-agent.example.com/replay"
+							placeholder={placeholderForMode(mode)}
 							value={webhookUrl}
 							onChange={(e) => setWebhookUrl(e.target.value)}
 							className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
 						/>
-						<p className="text-xs text-muted-foreground">
-							xray POSTs{" "}
-							<code className="font-mono">{`{userText, history, recordedToolResults}`}</code> here
-							and expects <code className="font-mono">{`{agentText, toolCalls?, ...}`}</code> back.
-						</p>
+						<p className="text-xs text-muted-foreground">{helpTextForMode(mode)}</p>
 					</div>
 
 					{mutation.isError && (
@@ -119,5 +180,38 @@ export function ReplayModal({ sourceSessionId, onClose, onStarted }: ReplayModal
 				</form>
 			</DialogContent>
 		</Dialog>
+	);
+}
+
+interface ModeOptionProps {
+	id: string;
+	name: string;
+	value: ReplayMode;
+	checked: boolean;
+	onChange: (mode: ReplayMode) => void;
+	label: string;
+	hint: string;
+}
+
+function ModeOption({ id, name, value, checked, onChange, label, hint }: ModeOptionProps) {
+	return (
+		<label
+			htmlFor={id}
+			className={`flex-1 cursor-pointer rounded-md border p-3 text-sm ${
+				checked ? "border-ring bg-accent/30" : "border-input"
+			}`}
+		>
+			<input
+				type="radio"
+				id={id}
+				name={name}
+				value={value}
+				checked={checked}
+				onChange={() => onChange(value)}
+				className="sr-only"
+			/>
+			<div className="font-medium">{label}</div>
+			<div className="text-xs text-muted-foreground">{hint}</div>
+		</label>
 	);
 }
