@@ -1,4 +1,4 @@
-# Voice Agent X-Ray
+# Voice Agent X-Ray (WIP - pre-alpha)
 
 > Voice agents are exploding. Debugging them is broken. **Voice Agent X-Ray**: drop in a conversation, see exactly what your agent did and why.
 
