@@ -12,7 +12,9 @@ import { afterEach, describe, expect, it } from "bun:test";
 // happy-dom must be registered before @testing-library/react evaluates — it
 // reads `document` at module load. Dynamic import preserves that ordering.
 registerHappyDom();
-const { cleanup, fireEvent, render, screen, waitFor } = await import("@testing-library/react");
+const { cleanup, fireEvent, render, screen, waitFor, within } = await import(
+	"@testing-library/react"
+);
 const { renderWithRouter } = await import("../test-utils.tsx");
 
 // Bun's test runner has no auto-cleanup hook — without this, the previous
@@ -51,10 +53,8 @@ describe("ConversationsList — populated", () => {
 		const { ui } = renderWithRouter({ initialEntries: ["/"] });
 		render(ui);
 		await waitFor(() => expect(screen.getByText("agent-new")).toBeTruthy());
-		// Each row renders Agent / Duration / Source as a <dl>; the agent
-		// values are the 1st, 4th, 7th <dd> across three rows.
-		const dds = screen.getAllByRole("definition");
-		const agentValues = dds.filter((_, i) => i % 3 === 0).map((n) => n.textContent);
+		const dataRows = screen.getAllByRole("row").slice(1);
+		const agentValues = dataRows.map((r) => within(r).getAllByRole("cell")[1]?.textContent);
 		expect(agentValues).toEqual(["agent-new", "agent-mid", "agent-old"]);
 	});
 
@@ -78,9 +78,8 @@ describe("ConversationsList — populated", () => {
 		const { ui } = renderWithRouter({ initialEntries: ["/"] });
 		render(ui);
 		await waitFor(() => expect(screen.getByText("from-ingest")).toBeTruthy());
-		// The 3rd <dd> of each row is the source (Agent → Duration → Source).
-		const dds = screen.getAllByRole("definition");
-		const sources = dds.filter((_, i) => i % 3 === 2).map((n) => n.textContent);
+		const dataRows = screen.getAllByRole("row").slice(1);
+		const sources = dataRows.map((r) => within(r).getAllByRole("cell")[3]?.textContent);
 		expect(sources).toEqual(["ingest", "adapter:elevenlabs"]);
 	});
 
