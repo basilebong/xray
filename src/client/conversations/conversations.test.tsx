@@ -78,6 +78,7 @@ describe("ConversationsList — populated", () => {
 		const { ui } = renderWithRouter({ initialEntries: ["/"] });
 		render(ui);
 		await waitFor(() => expect(screen.getByText("from-ingest")).toBeTruthy());
+		// The 3rd <dd> of each row is the source (Agent → Duration → Source).
 		const dds = screen.getAllByRole("definition");
 		const sources = dds.filter((_, i) => i % 3 === 2).map((n) => n.textContent);
 		expect(sources).toEqual(["ingest", "adapter:elevenlabs"]);
@@ -144,7 +145,10 @@ describe("ConversationsList — navigation", () => {
 		);
 		const { router, ui } = renderWithRouter({ initialEntries: ["/"] });
 		render(ui);
-		const row = await screen.findByRole("link", { name: /open session agent-8, started/i });
+		// The link's accessible name is the concatenation of its descendant
+		// text (timestamp + agent id + duration + source). agent-8 uniquely
+		// identifies the second row.
+		const row = await screen.findByRole("link", { name: /agent-8/i });
 		fireEvent.click(row);
 		await waitFor(() => expect(router.state.location.pathname).toBe("/sessions/sess-8"));
 	});

@@ -227,6 +227,8 @@ interface ErrorStateProps {
 function ErrorState({ error, onRetry }: ErrorStateProps) {
 	const notFound = error instanceof ConversationLoadError && error.status === 404;
 	return (
+		// role="alert" on the whole card so SR announces title + description
+		// together when the error mounts — not just the retry footer.
 		<Card role="alert">
 			<CardHeader>
 				<CardTitle className="flex items-center gap-2 text-base">

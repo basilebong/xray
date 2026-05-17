@@ -11,17 +11,16 @@ import {
 
 export function NotFoundView() {
 	return (
-		<Card role="alert">
+		<Card>
 			<CardHeader>
 				<CardTitle>Page not found.</CardTitle>
 				<CardDescription>The URL doesn't match any view in xray.</CardDescription>
 			</CardHeader>
 			<CardContent className="flex justify-end">
-				<Link to="/">
-					<Button size="sm" variant="outline">
-						Back to sessions
-					</Button>
-				</Link>
+				{/* `asChild` so the Button renders as the <Link>'s <a>, not a <button> nested in one. */}
+				<Button asChild size="sm" variant="outline">
+					<Link to="/">Back to sessions</Link>
+				</Button>
 			</CardContent>
 		</Card>
 	);

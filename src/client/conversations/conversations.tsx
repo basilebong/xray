@@ -125,13 +125,15 @@ interface ConversationRowProps {
 function ConversationRow({ session, onReplay }: ConversationRowProps) {
 	// One <Link> per row — wraps metadata + chevron, sits next to the Replay
 	// <button> as a sibling (not parent), so we never nest <button> in <a>.
+	// No `aria-label` on the <Link>: an aria-label would suppress the
+	// descendant text (Duration, Source badge) from the link's accessible
+	// name. Screen-reader users get the full row text instead.
 	return (
 		<li>
 			<Card className="group w-full text-left transition-colors hover:bg-accent/30">
 				<Link
 					to="/sessions/$sessionId"
 					params={{ sessionId: session.id }}
-					aria-label={`Open session ${session.agentId}, started ${formatAbsolute(session.startedAt)}`}
 					className="block rounded-xl focus:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
 				>
 					<CardHeader>

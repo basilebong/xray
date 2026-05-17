@@ -119,6 +119,7 @@ function RunningPanel({ run }: { run: ReplayRunResponse }) {
 						className="h-full bg-primary transition-[width] duration-300"
 						style={{ width: `${pct}%` }}
 						role="progressbar"
+						aria-label="Replay progress"
 						aria-valuemin={0}
 						aria-valuemax={100}
 						aria-valuenow={pct}
