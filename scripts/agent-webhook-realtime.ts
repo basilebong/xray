@@ -345,16 +345,28 @@ function openUpstream(
 		// `server_vad` would race against our manual commit for pre-recorded
 		// audio and the response would either never fire or fire on the wrong
 		// turn boundary.
+		// GA Realtime API requires `session.type: "realtime"`. The pre-GA preview
+		// accepted `session.update` without it; the GA cutover (May 7 2026)
+		// made it required. See OpenAI Realtime API reference (server events /
+		// session.update).
 		upstream.send(
 			JSON.stringify({
 				type: "session.update",
 				session: {
-					modalities: ["audio", "text"],
-					voice: VOICE,
-					input_audio_format: "pcm16",
-					output_audio_format: "pcm16",
+					type: "realtime",
+					model: MODEL,
+					output_modalities: ["audio"],
+					audio: {
+						input: {
+							format: { type: "audio/pcm", rate: 24000 },
+							turn_detection: null,
+						},
+						output: {
+							format: { type: "audio/pcm", rate: 24000 },
+							voice: VOICE,
+						},
+					},
 					instructions: SYSTEM_PROMPT,
-					turn_detection: null,
 					tools,
 					tool_choice: tools.length > 0 ? "auto" : "none",
 				},
