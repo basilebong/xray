@@ -6,8 +6,7 @@
 
 **Status: alpha / early access.** Pre-v1, no published Docker image yet, APIs and the ingest wire format may change before v1. Build from source today (see [Install](#install)); a tagged GHCR release is the v0.1.0 milestone. If you're trying it out, please open issues — that's the most useful contribution right now.
 
-<!-- Replace with the replay-diff screenshot (source vs replay side-by-side, regression badge visible). Commit under docs/assets/ and reference with a relative path. -->
-![xray replay diff view](docs/assets/hero.png)
+![xray replay diff view — source vs replay side-by-side with a latency regression and shape changes flagged](docs/assets/hero.png)
 
 ---
 
