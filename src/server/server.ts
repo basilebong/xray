@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 
 import { createAudioRouter } from "./audio/audio.router.ts";
+import { createDocsRouter } from "./docs/docs.router.ts";
 import { healthz } from "./healthz/healthz.ts";
 import { createIngestRouter } from "./ingest/ingest.router.ts";
 import { createRealtimeReplaysRouter } from "./replays/realtime/realtime.router.ts";
@@ -21,5 +22,8 @@ export function createApp(store: Store, config: AppConfig): Hono {
 	app.route("/v1", createReplaysRouter(store));
 	app.route("/v1", createRealtimeReplaysRouter(store, config.audioRoot));
 	app.route("/v1", createAudioRouter(store, config.audioRoot));
+	// Docs router must be mounted LAST so it enumerates every other router's
+	// describeRoute() metadata at request time.
+	app.route("/", createDocsRouter(app));
 	return app;
 }
