@@ -96,10 +96,8 @@ describe("ReplayView — completed diff", () => {
 		);
 		const { ui } = renderWithRouter({ initialEntries: ["/replays/r-1"] });
 		render(ui);
-		// Under the new diff semantics, a turn that differs ONLY in text is NOT a
-		// behavior divergence — text always varies between LLM runs. So this
-		// scenario (same tools, same shape, only different wording on the agent
-		// turn) should show "Behavior matches", and both texts still render.
+		// Same tools + same shape + text-only difference → "Behavior matches":
+		// text wording is shown but never flagged as divergence.
 		await waitFor(() => expect(screen.getByText(/behavior matches/i)).toBeTruthy());
 		expect(screen.getByText("hi back")).toBeTruthy();
 		expect(screen.getByText("hi there")).toBeTruthy();

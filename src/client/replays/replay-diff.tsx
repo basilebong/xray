@@ -14,14 +14,14 @@ import {
 	CardHeader,
 	CardTitle,
 } from "../components/ui/card.tsx";
+import { alignTurns, divergencesFor, plural, summarize, summarySentence } from "./diff/diff.ts";
 import type {
 	AnnotatedToolCall,
 	DiffSummary,
 	SummarySentence,
 	ToolCallStatus,
 	TurnDivergence,
-} from "./diff/diff.ts";
-import { alignTurns, divergencesFor, plural, summarize, summarySentence } from "./diff/diff.ts";
+} from "./diff/types.ts";
 
 export interface DiffPanelProps {
 	run: ReplayRunResponse;
@@ -61,28 +61,40 @@ function DiffBody({ source, target }: { source: Conversation; target: Conversati
 	return (
 		<div className="space-y-4">
 			<DiffSummaryCard summary={summary} sentence={sentence} />
-			<div className="grid grid-cols-2 gap-3 text-xs font-medium text-muted-foreground">
-				<div>Source</div>
-				<div>Replay</div>
-			</div>
-			<ol className="space-y-3">
-				{divergences.map(({ pair, divergence }) => (
-					<li key={pair.idx} className="grid grid-cols-2 gap-3">
-						<DiffCell
-							turn={pair.source}
-							annotatedTools={divergence.sourceToolCalls}
-							divergence={divergence}
-							side="source"
-						/>
-						<DiffCell
-							turn={pair.target}
-							annotatedTools={divergence.targetToolCalls}
-							divergence={divergence}
-							side="target"
-						/>
-					</li>
-				))}
-			</ol>
+			{divergences.length === 0 ? (
+				<Card>
+					<CardHeader>
+						<CardDescription>No conversation turns to compare.</CardDescription>
+					</CardHeader>
+				</Card>
+			) : (
+				<>
+					<div className="hidden sm:grid grid-cols-2 gap-3 text-xs font-medium text-muted-foreground">
+						<div>Source</div>
+						<div>Replay</div>
+					</div>
+					<ol className="space-y-3">
+						{divergences.map(({ pair, divergence }) => (
+							<li key={pair.idx} className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+								<DiffCell
+									turn={pair.source}
+									other={pair.target}
+									annotatedTools={divergence.sourceToolCalls}
+									divergence={divergence}
+									side="source"
+								/>
+								<DiffCell
+									turn={pair.target}
+									other={pair.source}
+									annotatedTools={divergence.targetToolCalls}
+									divergence={divergence}
+									side="target"
+								/>
+							</li>
+						))}
+					</ol>
+				</>
+			)}
 		</div>
 	);
 }
@@ -109,7 +121,7 @@ function DiffSummaryCard({
 		<Card>
 			<CardHeader>
 				<CardTitle className="flex items-center gap-2 text-base">
-					<Icon className={`size-4 ${iconClass}`} />
+					<Icon aria-hidden="true" className={`size-4 ${iconClass}`} />
 					{sentence.text}
 				</CardTitle>
 				<CardDescription>{subParts.join(" • ")}</CardDescription>
@@ -120,12 +132,13 @@ function DiffSummaryCard({
 
 interface DiffCellProps {
 	turn: ConversationTurn | undefined;
+	other: ConversationTurn | undefined;
 	annotatedTools: AnnotatedToolCall[];
 	divergence: TurnDivergence;
 	side: "source" | "target";
 }
 
-function DiffCell({ turn, annotatedTools, divergence, side }: DiffCellProps) {
+function DiffCell({ turn, other, annotatedTools, divergence, side }: DiffCellProps) {
 	if (turn === undefined) {
 		return (
 			<Card className="border-dashed text-muted-foreground">
@@ -137,6 +150,14 @@ function DiffCell({ turn, annotatedTools, divergence, side }: DiffCellProps) {
 	}
 	const cardDivergent =
 		divergence.toolsDiverge || divergence.latencyRegressed || divergence.shapeDiverged;
+	const latencyDelta =
+		side === "target" &&
+		divergence.latencyRegressed &&
+		turn.responseLatencyMs !== null &&
+		other?.responseLatencyMs !== null &&
+		other?.responseLatencyMs !== undefined
+			? turn.responseLatencyMs - other.responseLatencyMs
+			: null;
 	const latencyBadgeVariant: "destructive" | "outline" =
 		side === "target" && divergence.latencyRegressed ? "destructive" : "outline";
 	return (
@@ -146,20 +167,25 @@ function DiffCell({ turn, annotatedTools, divergence, side }: DiffCellProps) {
 					<Badge variant={turn.role === "agent" ? "default" : "secondary"}>{turn.role}</Badge>
 					{turn.responseLatencyMs !== null && (
 						<Badge variant={latencyBadgeVariant}>
-							<Zap />
+							<Zap aria-hidden="true" />
 							{turn.responseLatencyMs}ms
+							{latencyDelta !== null && ` (+${latencyDelta}ms)`}
 						</Badge>
 					)}
 					{turn.interrupted === true && (
 						<Badge variant="destructive">
-							<ZapOff />
+							<ZapOff aria-hidden="true" />
 							interrupted
 						</Badge>
 					)}
-					{divergence.shapeDiverged && <Badge variant="destructive">shape changed</Badge>}
+					{divergence.shapeDiverged && (
+						<Badge variant="outline" className="border-amber-500/50 text-amber-600">
+							shape changed
+						</Badge>
+					)}
 					{divergence.toolsDiverge && (
 						<Badge variant="outline" className="border-amber-500/50 text-amber-600">
-							tools {side === "source" ? "→" : "←"} differ
+							tools differ
 						</Badge>
 					)}
 				</CardDescription>
@@ -172,6 +198,7 @@ function DiffCell({ turn, annotatedTools, divergence, side }: DiffCellProps) {
 					<ul className="space-y-1 text-xs">
 						{annotatedTools.map((a) => (
 							<li key={a.call.idx} className={`font-mono ${toolCallClass(a.status)}`}>
+								<span className="mr-1 select-none">{toolCallStatusPrefix(a.status)}</span>
 								{a.call.name}({JSON.stringify(a.call.args)})
 							</li>
 						))}
@@ -180,6 +207,14 @@ function DiffCell({ turn, annotatedTools, divergence, side }: DiffCellProps) {
 			)}
 		</Card>
 	);
+}
+
+function toolCallStatusPrefix(status: ToolCallStatus): string {
+	return match(status)
+		.with("matched", () => "✓")
+		.with("args-differ", () => "≠")
+		.with("only-this-side", () => "✗")
+		.exhaustive();
 }
 
 function toolCallClass(status: ToolCallStatus): string {

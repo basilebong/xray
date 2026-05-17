@@ -4,66 +4,24 @@ import type {
 	ConversationTurn,
 } from "@/server/sessions/sessions.types.ts";
 
+import type {
+	AlignedPair,
+	AnnotatedToolCall,
+	DiffSummary,
+	PairWithDivergence,
+	SummarySentence,
+	TurnDivergence,
+} from "./types.ts";
+
 // Text wording is shown but NEVER counts as a divergence — LLM-generated text
 // varies on every run, so flagging it would flood the diff with noise the
-// target audience (voice-agent loop devs) doesn't care about. Behavior
-// divergence — tool calls, latency, conversation shape — is what matters.
+// target audience (voice-agent loop devs) doesn't care about.
 
-export interface AlignedPair {
-	idx: number;
-	source: ConversationTurn | undefined;
-	target: ConversationTurn | undefined;
-}
-
-export type ToolCallStatus = "matched" | "args-differ" | "only-this-side";
-
-export interface AnnotatedToolCall {
-	call: ConversationToolCall;
-	status: ToolCallStatus;
-}
-
-export interface TurnDivergence {
-	sourceToolCalls: AnnotatedToolCall[];
-	targetToolCalls: AnnotatedToolCall[];
-	/** Any tool call on either side is not "matched". */
-	toolsDiverge: boolean;
-	/** Target slower than source past the threshold (agent turns only). */
-	latencyRegressed: boolean;
-	/** Both sides present but structurally different — role or interrupted-state changed. */
-	shapeDiverged: boolean;
-}
-
-export interface DiffSummary {
-	alignedTurns: number;
-	sourceTurnCount: number;
-	targetTurnCount: number;
-	turnsWithToolDivergence: number;
-	missingToolsInReplay: number;
-	extraToolsInReplay: number;
-	latencyRegressions: number;
-	shapeDivergences: number;
-}
-
-export type SummaryTone = "ok" | "warn";
-
-export interface SummarySentence {
-	tone: SummaryTone;
-	text: string;
-}
-
-/**
- * Both gates required: a 1ms → 3ms response triples but is noise; an extra
- * 50ms is irrelevant on a 500ms turn but a regression on a 100ms one.
- */
+// Both gates required: 1→3ms is noise; 50ms is noise on a 500ms turn but a
+// real regression on a 100ms one.
 const LATENCY_REGRESSION_MULTIPLIER = 2;
 const LATENCY_REGRESSION_MIN_MS = 100;
 
-/**
- * Pair turns by idx so the same position in source and target line up. A
- * missing side becomes `undefined`. The renderer treats undefined as "no
- * turn at this position" — alignment doesn't compute divergence, that's
- * `diffTurn`'s job.
- */
 export function alignTurns(source: ConversationTurn[], target: ConversationTurn[]): AlignedPair[] {
 	const sourceByIdx = new Map(source.map((t) => [t.idx, t]));
 	const targetByIdx = new Map(target.map((t) => [t.idx, t]));
@@ -74,12 +32,8 @@ export function alignTurns(source: ConversationTurn[], target: ConversationTurn[
 }
 
 /**
- * Greedy match: (1) exact (name + args), (2) same name → args-differ,
- * (3) leftovers → only-this-side. Works for the common case where tools
- * appear in a similar order; doesn't try to be a full bipartite match.
- *
- * `JSON.stringify` on args is order-sensitive — two semantically-equal objects
- * with different key orders read as different. Acceptable for v1.
+ * Two greedy passes: exact (name + args via key-sorted serialize) → "matched";
+ * same name, different args → "args-differ"; leftovers → "only-this-side".
  */
 export function compareToolCalls(
 	source: readonly ConversationToolCall[],
@@ -94,9 +48,8 @@ export function compareToolCalls(
 		status: "only-this-side",
 	}));
 
-	const argsKey = (c: ConversationToolCall): string => `${c.name}::${JSON.stringify(c.args)}`;
+	const argsKey = (c: ConversationToolCall): string => `${c.name}::${stableStringify(c.args)}`;
 
-	// Pass 1: exact matches.
 	for (const sa of sourceAnnotated) {
 		if (sa.status !== "only-this-side") continue;
 		const ta = targetAnnotated.find(
@@ -107,7 +60,6 @@ export function compareToolCalls(
 			ta.status = "matched";
 		}
 	}
-	// Pass 2: same name, different args.
 	for (const sa of sourceAnnotated) {
 		if (sa.status !== "only-this-side") continue;
 		const ta = targetAnnotated.find(
@@ -120,6 +72,16 @@ export function compareToolCalls(
 	}
 
 	return { sourceAnnotated, targetAnnotated };
+}
+
+function stableStringify(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) {
+		return `[${value.map(stableStringify).join(",")}]`;
+	}
+	const obj: Record<string, unknown> = { ...value };
+	const entries = Object.entries(obj).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(",")}}`;
 }
 
 export function diffTurn(
@@ -149,6 +111,7 @@ function latencyRegressed(
 	const s = source.responseLatencyMs;
 	const t = target.responseLatencyMs;
 	if (s === null || t === null) return false;
+	if (s === 0) return t >= LATENCY_REGRESSION_MIN_MS;
 	return t >= s * LATENCY_REGRESSION_MULTIPLIER && t - s >= LATENCY_REGRESSION_MIN_MS;
 }
 
@@ -156,18 +119,10 @@ function shapeDiverged(
 	source: ConversationTurn | undefined,
 	target: ConversationTurn | undefined,
 ): boolean {
-	// Missing turns are handled by the renderer (border-dashed cells); we don't
-	// double-flag them here. shapeDiverged is for *both-sides-present* but
-	// structurally different turns.
 	if (source === undefined || target === undefined) return false;
 	if (source.role !== target.role) return true;
 	if ((source.interrupted ?? null) !== (target.interrupted ?? null)) return true;
 	return false;
-}
-
-export interface PairWithDivergence {
-	pair: AlignedPair;
-	divergence: TurnDivergence;
 }
 
 /** Compute divergence for every aligned pair once, so the renderer can reuse it. */

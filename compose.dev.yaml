@@ -98,8 +98,9 @@ services:
     volumes:
       - ./:/app
       - dev_node_modules:/app/node_modules
-    ports:
-      - "4000:4000"
+    # No `ports:` mapping on purpose — exposing this OPENAI_API_KEY-burning
+    # service to the host's LAN is a money/abuse risk. xray-dev reaches us via
+    # Docker network DNS (http://agent-webhook:4000).
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:4000/healthz || exit 1"]
       interval: 5s

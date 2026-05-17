@@ -86,16 +86,28 @@ const SYSTEM_PROMPT =
 // repeat). A small cap catches that; 5 is plenty for realistic agents.
 const MAX_TOOL_ROUNDS = 5;
 
-// Loose mirror of xray's WebhookRequestSchema (src/server/replays/replays.types.ts).
-// Intentionally re-derived here rather than imported — if the contract changes,
-// this script should break loudly at the boundary, not silently follow along.
+// Schema is re-derived from xray's WebhookRequestSchema (not imported) so a
+// contract change breaks loudly here at the boundary instead of silently.
+const MAX_HISTORY = 1024;
+const MAX_TURN_TEXT = 50_000;
+const MAX_TOOL_RESULTS = 256;
+
 const WebhookRequestSchema = v.object({
 	sessionId: v.string(),
 	turnIdx: v.number(),
-	userText: v.string(),
-	history: v.array(v.object({ role: v.string(), text: v.string() })),
-	recordedToolResults: v.array(
-		v.object({ name: v.string(), args: v.unknown(), result: v.unknown() }),
+	userText: v.pipe(v.string(), v.maxLength(MAX_TURN_TEXT)),
+	history: v.pipe(
+		v.array(
+			v.object({
+				role: v.string(),
+				text: v.pipe(v.string(), v.maxLength(MAX_TURN_TEXT)),
+			}),
+		),
+		v.maxLength(MAX_HISTORY),
+	),
+	recordedToolResults: v.pipe(
+		v.array(v.object({ name: v.string(), args: v.unknown(), result: v.unknown() })),
+		v.maxLength(MAX_TOOL_RESULTS),
 	),
 });
 type WebhookRequest = v.InferOutput<typeof WebhookRequestSchema>;
@@ -196,7 +208,9 @@ async function callOpenAI(
 	const messages: OpenAIMessage[] = [...initialMessages];
 	const collected: CallResult["toolCalls"] = [];
 
-	for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+	// `<=` so the model gets one final round AFTER the last allowed tool call
+	// to synthesize its text reply from the recorded results.
+	for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
 		const body = {
 			model: MODEL,
 			messages,
@@ -223,9 +237,6 @@ async function callOpenAI(
 		if (first === undefined) throw new Error("OpenAI returned no choices");
 		const message = first.message;
 
-		// Mid-loop: the model wants to call tools. Echo the assistant message
-		// back into the conversation, satisfy each call from recorded results,
-		// then ask again.
 		if (message.tool_calls !== undefined && message.tool_calls.length > 0) {
 			messages.push({
 				role: "assistant",
@@ -245,8 +256,12 @@ async function callOpenAI(
 			continue;
 		}
 
-		// Final: plain-text reply, no more tool calls.
-		return { agentText: message.content ?? "", toolCalls: collected };
+		if (message.content === null || message.content === "") {
+			throw new Error(
+				`Model returned no content and no tool calls (round ${round}) — model: ${MODEL}`,
+			);
+		}
+		return { agentText: message.content, toolCalls: collected };
 	}
 
 	throw new Error(
@@ -264,6 +279,10 @@ function safeParseJson(raw: string): unknown {
 	}
 }
 
+// 0.0.0.0 bind is safe because compose.dev.yaml deliberately doesn't publish
+// port 4000 to the host — the LAN can't reach this OPENAI_API_KEY-burning
+// surface. Don't "harden" by switching to 127.0.0.1; that breaks Docker DNS
+// from xray-dev (which is the only thing that needs to reach us).
 const server = Bun.serve({
 	port: PORT,
 	hostname: "0.0.0.0",
@@ -278,12 +297,13 @@ const server = Bun.serve({
 		let body: unknown;
 		try {
 			body = await req.json();
-		} catch (cause) {
-			return Response.json({ error: "invalid_json", detail: String(cause) }, { status: 400 });
+		} catch {
+			return Response.json({ error: "invalid_json" }, { status: 400 });
 		}
 		const parsed = v.safeParse(WebhookRequestSchema, body);
 		if (!parsed.success) {
-			return Response.json({ error: "invalid_shape", issues: parsed.issues }, { status: 400 });
+			console.error("invalid_shape:", parsed.issues);
+			return Response.json({ error: "invalid_shape" }, { status: 400 });
 		}
 		const payload = parsed.output;
 
@@ -292,8 +312,9 @@ const server = Bun.serve({
 		try {
 			result = await callOpenAI(buildMessages(payload), payload.recordedToolResults);
 		} catch (cause) {
+			// Don't echo `cause` to the caller — the OpenAI error body leaks org id and tier.
 			console.error(`turn ${payload.turnIdx} failed:`, cause);
-			return Response.json({ error: "upstream_failed", detail: String(cause) }, { status: 502 });
+			return Response.json({ error: "upstream_failed" }, { status: 502 });
 		}
 		const responseLatencyMs = Date.now() - startedAt;
 		const toolSuffix =
