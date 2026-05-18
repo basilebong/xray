@@ -5,11 +5,13 @@
 // Replay it pushes a small synthetic OTLP/JSON batch with a mix of
 // vocabularies (xray.assertion, xray.judge, xray.turn, gen_ai.chat,
 // gen_ai.execute_tool, langfuse generation) so the inspector exercises
-// every panel.
+// every panel, then uploads a single full-replay WAV that the client
+// segments by per-turn timestamps.
 //
 // Usage:
-//   pnpm dev                   # in one terminal — dev server on :8080
-//   pnpm seed                  # in another — POSTs through the new wire
+//   pnpm dev                              # in one terminal
+//   pnpm seed                             # in another — falls back to sine
+//   OPENAI_API_KEY=sk-... pnpm seed       # synthesizes real TTS for each turn
 //
 // Override target via env: XRAY_BASE_URL=http://otherhost:9000 pnpm seed
 
@@ -17,14 +19,28 @@ import * as v from "valibot";
 
 const EnvSchema = v.object({
 	XRAY_BASE_URL: v.optional(v.string()),
+	OPENAI_API_KEY: v.optional(v.string()),
+	OPENAI_TTS_MODEL: v.optional(v.string()),
 });
 const ENV = v.parse(EnvSchema, process.env);
 const BASE = ENV.XRAY_BASE_URL ?? "http://localhost:8080";
+const TTS_MODEL = ENV.OPENAI_TTS_MODEL ?? "gpt-4o-mini-tts";
 
 interface SeedTurn {
 	role: "user" | "agent";
 	text?: string;
 	key: string;
+}
+
+interface PlayedSegment {
+	idx: number;
+	role: "user" | "agent";
+	key: string;
+	transcript: string;
+	/** Offset from the replay's startedAt, in milliseconds. */
+	startMs: number;
+	/** End offset from the replay's startedAt, in milliseconds. */
+	endMs: number;
 }
 
 const CONVERSATION_ID = "demo-booking-happy-path";
@@ -37,6 +53,50 @@ const TURNS: SeedTurn[] = [
 	{ role: "user", text: "Anything else I should know?", key: "u1" },
 	{ role: "agent", key: "a1" },
 ];
+
+// Shared source of truth for what the spans say AND what the TTS synthesizes.
+// Timings are millisecond offsets from the replay's startedAt; the audio
+// helper pads with silence between segments so the on-disk WAV's playhead
+// matches the spans.
+const PLAYED: PlayedSegment[] = [
+	{
+		idx: 0,
+		role: "user",
+		key: "u0",
+		transcript: "Hi, I'd like to book a table for two at 7pm.",
+		startMs: 0,
+		endMs: 2500,
+	},
+	{
+		idx: 1,
+		role: "agent",
+		key: "a0",
+		transcript: "Confirmed — two at 7pm. Anything else I can help with?",
+		startMs: 3000,
+		endMs: 6500,
+	},
+	{
+		idx: 2,
+		role: "user",
+		key: "u1",
+		transcript: "Anything else I should know?",
+		startMs: 7000,
+		endMs: 9000,
+	},
+	{
+		idx: 3,
+		role: "agent",
+		key: "a1",
+		transcript: "We hold reservations for 15 minutes past your time — see you then.",
+		startMs: 9500,
+		endMs: 13000,
+	},
+];
+
+const TTS_VOICE_FOR_ROLE: Record<"user" | "agent", string> = {
+	user: "alloy",
+	agent: "verse",
+};
 
 async function main() {
 	await postConversation();
@@ -85,7 +145,9 @@ async function postReplay(idx: number): Promise<string> {
 }
 
 async function pushOtlp(replayId: string, idx: number) {
-	const startedMs = Date.UTC(2026, 4, 18 + idx, 12, 0, 0);
+	const replayStartMs = Date.UTC(2026, 4, 18 + idx, 12, 0, 0);
+	const lastEnd = PLAYED.at(-1)?.endMs ?? 0;
+	const judgeStart = lastEnd + 100;
 	const body = {
 		resourceSpans: [
 			{
@@ -101,45 +163,37 @@ async function pushOtlp(replayId: string, idx: number) {
 					{
 						scope: { name: "seed", attributes: [] },
 						spans: [
-							// Two turn rows — user then agent.
-							span({
-								name: "xray.turn",
-								start: startedMs,
-								end: startedMs + 1500,
-								attrs: {
-									"xray.turn.idx": 0,
-									"xray.turn.role": "user",
-									"xray.turn.key": "u0",
-									"xray.turn.transcript": "Hi, I'd like to book a table for two at 7pm.",
-								},
-							}),
-							span({
-								name: "xray.turn",
-								start: startedMs + 2000,
-								end: startedMs + 4000,
-								attrs: {
-									"xray.turn.idx": 1,
-									"xray.turn.role": "agent",
-									"xray.turn.key": "a0",
-									"xray.turn.transcript": "Confirmed — two at 7pm. Anything else?",
-								},
-							}),
-							// Assertion result.
+							// xray.turn spans — one per played segment. These are what
+							// the inspector slices the full-replay WAV by.
+							...PLAYED.map((p) =>
+								span({
+									name: "xray.turn",
+									start: replayStartMs + p.startMs,
+									end: replayStartMs + p.endMs,
+									attrs: {
+										"xray.turn.idx": p.idx,
+										"xray.turn.role": p.role,
+										"xray.turn.key": p.key,
+										"xray.turn.transcript": p.transcript,
+									},
+								}),
+							),
+							// Per-turn assertion on the first agent reply.
 							span({
 								name: "xray.assertion",
-								start: startedMs + 4000,
-								end: startedMs + 4001,
+								start: replayStartMs + 6500,
+								end: replayStartMs + 6501,
 								attrs: {
 									"xray.turn.idx": 1,
 									"xray.assertion.name": "confirms_booking",
 									"xray.assertion.status": idx === 1 ? "failed" : "passed",
 								},
 							}),
-							// Judge.
+							// Per-replay judge.
 							span({
 								name: "xray.judge",
-								start: startedMs + 4002,
-								end: startedMs + 4500,
+								start: replayStartMs + judgeStart,
+								end: replayStartMs + judgeStart + 400,
 								attrs: {
 									"xray.judge.status": idx === 1 ? "failed" : "passed",
 									"xray.judge.score": 100 - idx * 12,
@@ -149,11 +203,11 @@ async function pushOtlp(replayId: string, idx: number) {
 											: "Agent confirmed and offered follow-up",
 								},
 							}),
-							// gen_ai chat.
+							// gen_ai chat span for the first agent turn.
 							span({
 								name: "chat gpt-4o",
-								start: startedMs + 2100,
-								end: startedMs + 3600,
+								start: replayStartMs + 3000,
+								end: replayStartMs + 6000,
 								attrs: {
 									"gen_ai.operation.name": "chat",
 									"gen_ai.system": "openai",
@@ -162,11 +216,11 @@ async function pushOtlp(replayId: string, idx: number) {
 									"gen_ai.usage.output_tokens": 88 + idx,
 								},
 							}),
-							// gen_ai tool.
+							// gen_ai tool call.
 							span({
 								name: "execute_tool reserve_table",
-								start: startedMs + 3000,
-								end: startedMs + 3400,
+								start: replayStartMs + 3500,
+								end: replayStartMs + 3900,
 								attrs: {
 									"gen_ai.operation.name": "execute_tool",
 									"gen_ai.tool.name": "reserve_table",
@@ -177,8 +231,8 @@ async function pushOtlp(replayId: string, idx: number) {
 							// Langfuse generation — surfaces a different provider for diversity.
 							span({
 								name: "anthropic-summarize",
-								start: startedMs + 3700,
-								end: startedMs + 3900,
+								start: replayStartMs + 9700,
+								end: replayStartMs + 9900,
 								attrs: {
 									"langfuse.observation.type": "generation",
 									"langfuse.observation.provider": "anthropic",
@@ -205,14 +259,15 @@ async function pushOtlp(replayId: string, idx: number) {
 // `replay_turns.started_at`/`ended_at` from the xray.turn spans pushed
 // above, so this single WAV plays back per-turn segments in the inspector.
 //
-// 5 seconds of mono 16-bit PCM at 16 kHz — long enough to span both turns
-// (the spans run from t=0 to t≈4 s), small enough to keep `pnpm seed` quick.
-async function uploadReplayAudio(replayId: string, idx: number) {
-	const sampleRate = 16_000;
-	const durationS = 5;
-	// Different tones per replay so they're audibly distinguishable in the UI.
-	const freqHz = 220 + idx * 110;
-	const wav = makeSineWav(sampleRate, durationS, freqHz);
+// When OPENAI_API_KEY is set, each segment's `transcript` is synthesized
+// via OpenAI's `/v1/audio/speech` (PCM, 24 kHz mono) and the segments are
+// concatenated with silence padding so the playhead lines up with the
+// span timings. Without a key, falls back to a per-turn sine tone — still
+// audibly turn-shaped but not speech.
+async function uploadReplayAudio(replayId: string, replayIdx: number) {
+	const wav = ENV.OPENAI_API_KEY
+		? await synthesizeReplayWavViaOpenAI(ENV.OPENAI_API_KEY)
+		: synthesizeReplayWavViaSine(replayIdx);
 	const res = await fetch(`${BASE}/v1/replays/${replayId}/audio`, {
 		method: "POST",
 		headers: { "content-type": "audio/wav" },
@@ -225,10 +280,10 @@ async function patchReplay(replayId: string, idx: number) {
 	const body = {
 		status: idx === 2 ? "failed" : "completed",
 		failureReason: idx === 2 ? "runtime_error" : null,
-		finishedAt: new Date(Date.UTC(2026, 4, 18 + idx, 12, 0, 5)).toISOString(),
-		transcript:
-			"User: Hi, I'd like to book a table for two at 7pm.\n" +
-			"Agent: Confirmed — two at 7pm. Anything else?",
+		finishedAt: new Date(Date.UTC(2026, 4, 18 + idx, 12, 0, 15)).toISOString(),
+		transcript: PLAYED.map((p) => `${p.role === "user" ? "User" : "Agent"}: ${p.transcript}`).join(
+			"\n",
+		),
 	};
 	const res = await fetch(`${BASE}/v1/replays/${replayId}`, {
 		method: "PATCH",
@@ -238,7 +293,123 @@ async function patchReplay(replayId: string, idx: number) {
 	if (!res.ok) throw new Error(`PATCH /v1/replays/:id -> ${res.status}`);
 }
 
-// --- helpers ---
+// --- audio helpers ---
+
+const TTS_SAMPLE_RATE = 24_000; // OpenAI TTS PCM is fixed at 24 kHz mono.
+const SINE_SAMPLE_RATE = 16_000;
+
+/**
+ * TTS each segment, drop the bytes at the right offset of a single
+ * 24 kHz mono PCM buffer, render to WAV. Buffer length = max of the
+ * spans' endMs and the actual TTS audio runover, so nothing gets cut.
+ */
+async function synthesizeReplayWavViaOpenAI(apiKey: string): Promise<ArrayBuffer> {
+	const placed: { startSamples: number; samples: Int16Array }[] = [];
+	for (const seg of PLAYED) {
+		const samples = await ttsToPcm(apiKey, seg.transcript, TTS_VOICE_FOR_ROLE[seg.role]);
+		const startSamples = Math.round((seg.startMs / 1000) * TTS_SAMPLE_RATE);
+		placed.push({ startSamples, samples });
+	}
+	const spanEndSamples = Math.round(((PLAYED.at(-1)?.endMs ?? 0) / 1000) * TTS_SAMPLE_RATE);
+	const ttsEndSamples = placed.reduce(
+		(max, p) => Math.max(max, p.startSamples + p.samples.length),
+		0,
+	);
+	const totalSamples = Math.max(spanEndSamples, ttsEndSamples);
+
+	const mix = new Int16Array(totalSamples);
+	for (const { startSamples, samples } of placed) {
+		mix.set(samples, startSamples);
+	}
+	return wavFromPcm(mix, TTS_SAMPLE_RATE);
+}
+
+async function ttsToPcm(apiKey: string, text: string, voice: string): Promise<Int16Array> {
+	const res = await fetch("https://api.openai.com/v1/audio/speech", {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			authorization: `Bearer ${apiKey}`,
+		},
+		body: JSON.stringify({
+			model: TTS_MODEL,
+			voice,
+			input: text,
+			// PCM = raw 16-bit signed little-endian, 24 kHz mono. Trivial
+			// to concatenate without an audio-decoding library.
+			response_format: "pcm",
+		}),
+	});
+	if (!res.ok) {
+		throw new Error(`OpenAI TTS -> ${res.status} ${res.statusText}: ${await res.text()}`);
+	}
+	const buf = await res.arrayBuffer();
+	return new Int16Array(buf);
+}
+
+/**
+ * Fallback when no OpenAI key is configured. Different sine frequency
+ * per replay so the three runs sound different, with a per-segment
+ * envelope so turn boundaries are audible.
+ */
+function synthesizeReplayWavViaSine(replayIdx: number): ArrayBuffer {
+	const sampleRate = SINE_SAMPLE_RATE;
+	const totalSamples = Math.round(((PLAYED.at(-1)?.endMs ?? 0) / 1000) * sampleRate);
+	const mix = new Int16Array(totalSamples);
+	const baseFreq = 220 + replayIdx * 110;
+	for (const seg of PLAYED) {
+		const start = Math.round((seg.startMs / 1000) * sampleRate);
+		const end = Math.round((seg.endMs / 1000) * sampleRate);
+		// User turns ride at baseFreq, agent turns up a fifth.
+		const freq = seg.role === "user" ? baseFreq : baseFreq * 1.5;
+		const amplitude = 0.25 * 0x7fff;
+		for (let i = start; i < end && i < totalSamples; i++) {
+			const sample = Math.round(
+				amplitude * Math.sin((2 * Math.PI * freq * (i - start)) / sampleRate),
+			);
+			mix[i] = sample;
+		}
+	}
+	return wavFromPcm(mix, sampleRate);
+}
+
+/**
+ * Wrap raw 16-bit signed PCM samples (mono) in a minimal RIFF/WAV
+ * container. No external dep — the format is small enough to spell out
+ * by hand and the resulting file plays in every browser.
+ */
+function wavFromPcm(samples: Int16Array, sampleRate: number): ArrayBuffer {
+	const bytesPerSample = 2;
+	const dataBytes = samples.length * bytesPerSample;
+	const buffer = new ArrayBuffer(44 + dataBytes);
+	const view = new DataView(buffer);
+
+	writeAscii(view, 0, "RIFF");
+	view.setUint32(4, 36 + dataBytes, true);
+	writeAscii(view, 8, "WAVE");
+	writeAscii(view, 12, "fmt ");
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true); // PCM format
+	view.setUint16(22, 1, true); // mono
+	view.setUint32(24, sampleRate, true);
+	view.setUint32(28, sampleRate * bytesPerSample, true);
+	view.setUint16(32, bytesPerSample, true);
+	view.setUint16(34, 16, true);
+	writeAscii(view, 36, "data");
+	view.setUint32(40, dataBytes, true);
+
+	for (let i = 0; i < samples.length; i++) {
+		const sample = samples[i] ?? 0;
+		view.setInt16(44 + i * bytesPerSample, sample, true);
+	}
+	return buffer;
+}
+
+function writeAscii(view: DataView, offset: number, ascii: string): void {
+	for (let i = 0; i < ascii.length; i++) view.setUint8(offset + i, ascii.charCodeAt(i));
+}
+
+// --- otlp wire helpers ---
 
 function kv(key: string, value: string | number | boolean) {
 	if (typeof value === "string") return { key, value: { stringValue: value } };
@@ -266,48 +437,6 @@ function span(opts: {
 function pad(seed: string, length: number): string {
 	const hex = [...seed].reduce((acc, ch) => acc * 31 + ch.charCodeAt(0), 7).toString(16);
 	return (hex + "0".repeat(length)).slice(0, length);
-}
-
-/**
- * Build a minimal RIFF/WAV (PCM, mono, 16-bit) of a sine wave. No external
- * dep, no audio-encoding library — the format is small enough to spell out
- * by hand and the resulting file plays in every browser.
- */
-function makeSineWav(sampleRate: number, durationS: number, freqHz: number): ArrayBuffer {
-	const sampleCount = sampleRate * durationS;
-	const bytesPerSample = 2; // 16-bit
-	const dataBytes = sampleCount * bytesPerSample;
-	const buffer = new ArrayBuffer(44 + dataBytes);
-	const view = new DataView(buffer);
-
-	// RIFF header
-	writeAscii(view, 0, "RIFF");
-	view.setUint32(4, 36 + dataBytes, true);
-	writeAscii(view, 8, "WAVE");
-	// fmt chunk
-	writeAscii(view, 12, "fmt ");
-	view.setUint32(16, 16, true); // PCM chunk size
-	view.setUint16(20, 1, true); // PCM format
-	view.setUint16(22, 1, true); // mono
-	view.setUint32(24, sampleRate, true);
-	view.setUint32(28, sampleRate * bytesPerSample, true); // byte rate
-	view.setUint16(32, bytesPerSample, true); // block align
-	view.setUint16(34, 16, true); // bits per sample
-	// data chunk
-	writeAscii(view, 36, "data");
-	view.setUint32(40, dataBytes, true);
-
-	// Sine samples, amplitude 0.25 so the seed audio isn't ear-blasting.
-	const amplitude = 0.25 * 0x7fff;
-	for (let i = 0; i < sampleCount; i++) {
-		const sample = Math.round(amplitude * Math.sin((2 * Math.PI * freqHz * i) / sampleRate));
-		view.setInt16(44 + i * bytesPerSample, sample, true);
-	}
-	return buffer;
-}
-
-function writeAscii(view: DataView, offset: number, ascii: string): void {
-	for (let i = 0; i < ascii.length; i++) view.setUint8(offset + i, ascii.charCodeAt(i));
 }
 
 main().catch((err) => {
