@@ -18,7 +18,7 @@ interface ReplayDetailFixture {
 	conversationId: string;
 	conversationVersion: string;
 	status: "running" | "completed" | "failed";
-	failureReason: "timeout" | "judge_errored" | "runtime_errored" | null;
+	failureReason: "agent_not_joined" | "runtime_error" | "audio_missing" | "sdk_aborted" | "other" | null;
 	modality: "voice" | "text";
 	startedAt: string;
 	finishedAt: string | null;

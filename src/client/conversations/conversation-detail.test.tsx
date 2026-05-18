@@ -20,7 +20,13 @@ interface ReplaySummary {
 	conversationId: string;
 	conversationVersion: string;
 	status: "running" | "completed" | "failed";
-	failureReason: "timeout" | "judge_errored" | "runtime_errored" | null;
+	failureReason:
+		| "agent_not_joined"
+		| "runtime_error"
+		| "audio_missing"
+		| "sdk_aborted"
+		| "other"
+		| null;
 	modality: "voice" | "text";
 	startedAt: string;
 	finishedAt: string | null;
@@ -48,7 +54,7 @@ const REPLAY_FIXTURES: ReplaySummary[] = [
 		conversationId: CONVERSATION_ID,
 		conversationVersion: "v1",
 		status: "failed",
-		failureReason: "runtime_errored",
+		failureReason: "runtime_error",
 		modality: "voice",
 		startedAt: "2026-05-15T10:01:00.000Z",
 		finishedAt: "2026-05-15T10:01:30.000Z",
@@ -97,7 +103,7 @@ describe("ConversationDetail", () => {
 		render(ui);
 
 		await waitFor(() => expect(screen.getByText("completed")).toBeTruthy());
-		expect(screen.getByText(/failed: runtime_errored/)).toBeTruthy();
+		expect(screen.getByText(/failed: runtime_error/)).toBeTruthy();
 		expect(screen.getByText("running")).toBeTruthy();
 	});
 
@@ -108,8 +114,8 @@ describe("ConversationDetail", () => {
 		});
 		render(ui);
 
-		const failedChip = await waitFor(() => screen.getByText(/failed: runtime_errored/));
-		expect(failedChip.textContent).toContain("runtime_errored");
+		const failedChip = await waitFor(() => screen.getByText(/failed: runtime_error/));
+		expect(failedChip.textContent).toContain("runtime_error");
 	});
 
 	it("Compare-Replays button enables for 2 selected, disables for 1 or >8", async () => {
