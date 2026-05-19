@@ -52,7 +52,10 @@ COPY --chown=xray:users --from=prod-deps /app/node_modules ./node_modules
 # Ordered most-stable to least-stable so source edits don't bust the layer
 # cache on package.json / tsconfig.json. Bun runs TS directly, so we ship .ts.
 # index.html is bundled at server boot — see src/server/main.ts.
-COPY --chown=xray:users package.json tsconfig.json index.html ./
+# bunfig.toml's [serve.static].plugins registers bun-plugin-tailwind for
+# Bun.serve's HTML bundler — without it, globals.css ships its @theme
+# tokens but zero Tailwind utility classes, so the SPA renders unstyled.
+COPY --chown=xray:users package.json tsconfig.json bunfig.toml index.html ./
 COPY --chown=xray:users src ./src
 
 ENV HOST=0.0.0.0 \

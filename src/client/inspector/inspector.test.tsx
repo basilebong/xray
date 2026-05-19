@@ -1,359 +1,202 @@
 import { HttpResponse, http } from "msw";
 
-import {
-	makeConversation,
-	makeConversationToolCall,
-	makeConversationTurn,
-} from "@/server/sessions/sessions.test-utils.ts";
 import { server } from "@/test-server.ts";
 
 import { registerHappyDom } from "../test-happy-dom.ts";
 import { afterEach, describe, expect, it } from "bun:test";
 
 registerHappyDom();
-const { cleanup, fireEvent, render, screen, waitFor, within } = await import(
-	"@testing-library/react"
-);
+const { cleanup, render, screen, waitFor } = await import("@testing-library/react");
 const { renderWithRouter } = await import("../test-utils.tsx");
 
 afterEach(() => cleanup());
 
-const CONVO_URL = "http://localhost/v1/sessions/sess-1";
+const REPLAY_ID = "44444444-4444-4444-4444-444444444444";
 
-describe("Inspector — pending state", () => {
-	it("marks the section as aria-busy while loading", async () => {
-		// MSW handler that never resolves so we observe the pending state. We
-		// can't await the eventual render here — we wait for the section to
-		// mount, then assert synchronously.
-		const never = new Promise<Response>(() => {
-			// noop: intentionally never resolves to keep the query in `pending`.
-		});
-		server.use(http.get(CONVO_URL, () => never));
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
+interface ReplayDetailFixture {
+	id: string;
+	conversationId: string;
+	conversationVersion: string;
+	status: "running" | "completed" | "failed";
+	failureReason: "agent_not_joined" | "runtime_error" | "audio_missing" | "sdk_aborted" | "other" | null;
+	modality: "voice" | "text";
+	startedAt: string;
+	finishedAt: string | null;
+	audioPath: string | null;
+	transcript: string | null;
+	runConfig: unknown;
+	judge: {
+		status: "passed" | "failed" | "errored" | null;
+		score: number | null;
+		reason: string | null;
+		error: string | null;
+	};
+	turns: Array<{
+		idx: number;
+		role: "user" | "agent";
+		key: string | null;
+		startedAt: string | null;
+		endedAt: string | null;
+		transcript: string | null;
+		audioPath: string | null;
+	}>;
+	assertions: Array<{
+		id: number;
+		turnIdx: number;
+		name: string;
+		status: "passed" | "failed" | "errored";
+		message: string | null;
+		recordedAt: string;
+	}>;
+	toolCalls: never[];
+	modelUsage: never[];
+	spans: never[];
+}
+
+function buildReplay(overrides: Partial<ReplayDetailFixture> = {}): ReplayDetailFixture {
+	return {
+		id: REPLAY_ID,
+		conversationId: "conv-x",
+		conversationVersion: "v1",
+		status: "completed",
+		failureReason: null,
+		modality: "voice",
+		startedAt: "2026-05-15T10:00:00.000Z",
+		finishedAt: "2026-05-15T10:00:30.000Z",
+		audioPath: null,
+		transcript: null,
+		runConfig: null,
+		judge: { status: null, score: null, reason: null, error: null },
+		turns: [
+			{
+				idx: 0,
+				role: "user",
+				key: "greet",
+				startedAt: "2026-05-15T10:00:01.000Z",
+				endedAt: "2026-05-15T10:00:02.000Z",
+				transcript: "hello",
+				audioPath: null,
+			},
+			{
+				idx: 1,
+				role: "agent",
+				key: "respond",
+				startedAt: "2026-05-15T10:00:03.000Z",
+				endedAt: "2026-05-15T10:00:04.000Z",
+				transcript: "hi there",
+				audioPath: null,
+			},
+		],
+		assertions: [],
+		toolCalls: [],
+		modelUsage: [],
+		spans: [],
+		...overrides,
+	};
+}
+
+function mockReplay(replay: ReplayDetailFixture) {
+	server.use(
+		http.get(`http://localhost/v1/replays/${replay.id}`, () => HttpResponse.json(replay)),
+	);
+}
+
+describe("Inspector empty states", () => {
+	it("renders the new @xray.trace copy when the replay has no spans", async () => {
+		mockReplay(buildReplay({ spans: [] }));
+		const { ui } = renderWithRouter({ initialEntries: [`/replays/${REPLAY_ID}`] });
 		render(ui);
-		const section = await screen.findByLabelText(/^session$/i);
-		expect(section.getAttribute("aria-busy")).toBe("true");
+
+		const empty = await waitFor(() => screen.getByText(/No trace spans recorded/i));
+		expect(empty.textContent).toMatch(/@xray\.trace\.stage/);
+		expect(empty.textContent).toMatch(/docs\/SDK\.md/);
 	});
 });
 
-describe("Inspector — pipeline-style fixture", () => {
-	it("renders turns with response-latency chips and no barge-in indicator", async () => {
-		const conv = makeConversation({
-			id: "sess-1",
-			agentId: "agent-pipe",
-			turns: [
-				makeConversationTurn({ id: "t-0", idx: 0, role: "user", text: "hi" }),
-				makeConversationTurn({
-					id: "t-1",
-					idx: 1,
-					role: "agent",
-					text: "hi back",
-					responseLatencyMs: 420,
-				}),
-			],
-		});
-		server.use(http.get(CONVO_URL, () => HttpResponse.json(conv)));
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
+describe("Inspector AssertionsCard summary", () => {
+	it("renders aggregate pass/fail/errored counts as the summary card", async () => {
+		mockReplay(
+			buildReplay({
+				assertions: [
+					{
+						id: 1,
+						turnIdx: 0,
+						name: "a",
+						status: "passed",
+						message: null,
+						recordedAt: "2026-05-15T10:00:05.000Z",
+					},
+					{
+						id: 2,
+						turnIdx: 0,
+						name: "b",
+						status: "passed",
+						message: null,
+						recordedAt: "2026-05-15T10:00:05.000Z",
+					},
+					{
+						id: 3,
+						turnIdx: 1,
+						name: "c",
+						status: "failed",
+						message: "boom",
+						recordedAt: "2026-05-15T10:00:05.000Z",
+					},
+					{
+						id: 4,
+						turnIdx: 1,
+						name: "d",
+						status: "errored",
+						message: null,
+						recordedAt: "2026-05-15T10:00:05.000Z",
+					},
+				],
+			}),
+		);
+		const { ui } = renderWithRouter({ initialEntries: [`/replays/${REPLAY_ID}`] });
 		render(ui);
 
-		await waitFor(() => expect(screen.getByText("agent-pipe")).toBeTruthy());
-		expect(screen.getByText("hi")).toBeTruthy();
-		expect(screen.getByText("hi back")).toBeTruthy();
-		expect(screen.getByText("420ms")).toBeTruthy();
-		expect(screen.queryByText(/interrupted/i)).toBeNull();
+		await waitFor(() => expect(screen.getByLabelText("2 passed")).toBeTruthy());
+		expect(screen.getByLabelText("1 failed")).toBeTruthy();
+		expect(screen.getByLabelText("1 errored")).toBeTruthy();
 	});
 });
 
-describe("Inspector — voice-to-voice fixture", () => {
-	it("renders the barge-in chip with the interrupted-at value", async () => {
-		const conv = makeConversation({
-			id: "sess-1",
-			turns: [
-				makeConversationTurn({
-					id: "t-0",
-					idx: 0,
-					role: "agent",
-					text: "long answer that got cut off",
-					interrupted: true,
-					interruptedAtMs: 800,
-				}),
-			],
-		});
-		server.use(http.get(CONVO_URL, () => HttpResponse.json(conv)));
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-
-		await waitFor(() => expect(screen.getByText(/interrupted at 800ms/i)).toBeTruthy());
-	});
-
-	it("renders the barge-in chip without an interrupted-at value when null", async () => {
-		const conv = makeConversation({
-			id: "sess-1",
-			turns: [
-				makeConversationTurn({
-					id: "t-0",
-					idx: 0,
-					role: "agent",
-					interrupted: true,
-					interruptedAtMs: null,
-				}),
-			],
-		});
-		server.use(http.get(CONVO_URL, () => HttpResponse.json(conv)));
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-
-		await waitFor(() => {
-			const badge = screen.getByLabelText(/^interrupted$/i);
-			expect(badge).toBeTruthy();
-		});
-	});
-});
-
-describe("Inspector — tool-heavy fixture", () => {
-	it("renders tool calls inside the turn with args, result, and latency", async () => {
-		const conv = makeConversation({
-			id: "sess-1",
-			turns: [
-				makeConversationTurn({
-					id: "t-0",
-					idx: 0,
-					role: "agent",
-					text: "looking that up",
-					toolCalls: [
-						makeConversationToolCall({
-							idx: 0,
-							name: "weather_lookup",
-							args: { city: "Paris" },
-							result: { temp: 21 },
-							latencyMs: 123,
-						}),
-					],
-				}),
-			],
-		});
-		server.use(http.get(CONVO_URL, () => HttpResponse.json(conv)));
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-
-		await waitFor(() => expect(screen.getByText("weather_lookup")).toBeTruthy());
-		expect(screen.getByText("123ms")).toBeTruthy();
-		// The args / result blocks render via JSON.stringify — assert on a
-		// substring rather than exact whitespace.
-		expect(screen.getByText(/"city": "Paris"/)).toBeTruthy();
-		expect(screen.getByText(/"temp": 21/)).toBeTruthy();
-	});
-});
-
-describe("Inspector — audio playback", () => {
-	it("renders an <audio controls> element with preload=none when a turn has audioPath", async () => {
-		const conv = makeConversation({
-			id: "sess-1",
-			turns: [
-				makeConversationTurn({
-					id: "t-0",
-					idx: 0,
-					role: "agent",
-					text: "hi",
-					audioPath: "sess-1/0.opus",
-				}),
-			],
-		});
-		server.use(http.get(CONVO_URL, () => HttpResponse.json(conv)));
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-
-		const player = await screen.findByLabelText(/audio for agent turn 0/i);
-		// preload=none keeps the bytes off the wire until the user clicks play —
-		// the lazy-load contract spelled out in the issue.
-		expect(player.getAttribute("preload")).toBe("none");
-		expect(player.getAttribute("src")).toBe(
-			`${window.location.origin}/v1/sessions/sess-1/turns/0/audio`,
+describe("Inspector TurnBlock inline assertions", () => {
+	it("renders the assertions whose turnIdx matches the turn, inline below it", async () => {
+		mockReplay(
+			buildReplay({
+				assertions: [
+					{
+						id: 1,
+						turnIdx: 0,
+						name: "user.said_hello",
+						status: "passed",
+						message: null,
+						recordedAt: "2026-05-15T10:00:05.000Z",
+					},
+					{
+						id: 2,
+						turnIdx: 1,
+						name: "agent.was_polite",
+						status: "failed",
+						message: "did not greet",
+						recordedAt: "2026-05-15T10:00:05.000Z",
+					},
+				],
+			}),
 		);
-	});
-
-	it("does not render an audio element when audioPath is null", async () => {
-		const conv = makeConversation({
-			id: "sess-1",
-			turns: [makeConversationTurn({ id: "t-0", idx: 0, role: "agent", text: "no audio here" })],
-		});
-		server.use(http.get(CONVO_URL, () => HttpResponse.json(conv)));
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
+		const { ui } = renderWithRouter({ initialEntries: [`/replays/${REPLAY_ID}`] });
 		render(ui);
 
-		await waitFor(() => expect(screen.getByText("no audio here")).toBeTruthy());
-		expect(screen.queryByLabelText(/audio for /i)).toBeNull();
-	});
-
-	it("percent-encodes a session id with special characters in the audio src", async () => {
-		const sessionId = "sess.with-dots_and-dashes";
-		const conv = makeConversation({
-			id: sessionId,
-			turns: [
-				makeConversationTurn({
-					id: "t-0",
-					idx: 3,
-					role: "agent",
-					audioPath: `${sessionId}/3.wav`,
-				}),
-			],
-		});
-		server.use(
-			http.get(`http://localhost/v1/sessions/${sessionId}`, () => HttpResponse.json(conv)),
+		const turn0List = await waitFor(() =>
+			screen.getByRole("list", { name: /Assertions for turn 0/i }),
 		);
-		const { ui } = renderWithRouter({ initialEntries: [`/sessions/${sessionId}`] });
-		render(ui);
+		expect(turn0List.textContent).toMatch(/user\.said_hello/);
+		expect(turn0List.textContent).not.toMatch(/agent\.was_polite/);
 
-		const player = await screen.findByLabelText(/audio for agent turn 3/i);
-		expect(player.getAttribute("src")).toBe(
-			`${window.location.origin}/v1/sessions/${encodeURIComponent(sessionId)}/turns/3/audio`,
-		);
-	});
-});
-
-describe("Inspector — empty transcript", () => {
-	it("renders the empty-turns hint when the session has metadata but no turns", async () => {
-		server.use(
-			http.get(CONVO_URL, () => HttpResponse.json(makeConversation({ id: "sess-1", turns: [] }))),
-		);
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-		await waitFor(() => expect(screen.getByText(/no turns yet/i)).toBeTruthy());
-	});
-});
-
-describe("Inspector — error paths", () => {
-	it("renders a 'session not found' alert on 404 without a retry button", async () => {
-		server.use(
-			http.get(CONVO_URL, () =>
-				HttpResponse.json({ error: "session_not_found", sessionId: "sess-1" }, { status: 404 }),
-			),
-		);
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-		expect(await screen.findByText(/session not found/i)).toBeTruthy();
-		// 404 is terminal — no point retrying the same id.
-		expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
-	});
-
-	it("renders an alert with a retry button on 500", async () => {
-		server.use(
-			http.get(CONVO_URL, () => HttpResponse.json({ error: "store_failure" }, { status: 500 })),
-		);
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-		expect(await screen.findByRole("alert")).toBeTruthy();
-		expect(screen.getByRole("button", { name: /try again/i })).toBeTruthy();
-	});
-
-	it("renders an alert when the body has the wrong shape", async () => {
-		server.use(http.get(CONVO_URL, () => HttpResponse.json({ nope: 1 })));
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-		expect(await screen.findByRole("alert")).toBeTruthy();
-	});
-});
-
-describe("Inspector — back navigation", () => {
-	it("navigates to / when the back button is clicked", async () => {
-		server.use(
-			http.get(CONVO_URL, () => HttpResponse.json(makeConversation({ id: "sess-1" }))),
-			http.get("http://localhost/v1/sessions", () =>
-				HttpResponse.json({ sessions: [], nextCursor: null }),
-			),
-		);
-		const { router, ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-		const back = await screen.findByRole("link", { name: /all sessions/i });
-		fireEvent.click(back);
-		await waitFor(() => expect(router.state.location.pathname).toBe("/"));
-	});
-
-	it("renders the back button with the outline variant", async () => {
-		server.use(http.get(CONVO_URL, () => HttpResponse.json(makeConversation({ id: "sess-1" }))));
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-		const back = await screen.findByRole("link", { name: /all sessions/i });
-		// Outline variant emits a `border` class; ghost (the prior variant) didn't.
-		expect(back.className).toMatch(/\bborder\b/);
-	});
-});
-
-describe("Inspector — tab routing via search param", () => {
-	it("defaults to the Transcript tab when ?tab is absent", async () => {
-		server.use(http.get(CONVO_URL, () => HttpResponse.json(makeConversation({ id: "sess-1" }))));
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-		const transcriptTab = await screen.findByRole("tab", { name: /transcript/i });
-		expect(transcriptTab.getAttribute("data-state")).toBe("active");
-		const replaysTab = screen.getByRole("tab", { name: /replays/i });
-		expect(replaysTab.getAttribute("data-state")).toBe("inactive");
-	});
-
-	it("renders the Replays tab as active when ?tab=replays", async () => {
-		server.use(
-			http.get(CONVO_URL, () => HttpResponse.json(makeConversation({ id: "sess-1" }))),
-			http.get("http://localhost/v1/sessions/sess-1/replays", () =>
-				HttpResponse.json({ items: [] }),
-			),
-		);
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1?tab=replays"] });
-		render(ui);
-		const replaysTab = await screen.findByRole("tab", { name: /replays/i });
-		expect(replaysTab.getAttribute("data-state")).toBe("active");
-	});
-
-	it("pushes ?tab=replays to the URL when the Replays tab is clicked", async () => {
-		server.use(
-			http.get(CONVO_URL, () => HttpResponse.json(makeConversation({ id: "sess-1" }))),
-			http.get("http://localhost/v1/sessions/sess-1/replays", () =>
-				HttpResponse.json({ items: [] }),
-			),
-		);
-		const { router, ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-		const replaysTab = await screen.findByRole("tab", { name: /replays/i });
-		// Radix Tabs activates on `onMouseDown`, not `onClick`.
-		fireEvent.mouseDown(replaysTab);
-		await waitFor(() => expect(router.state.location.search).toEqual({ tab: "replays" }));
-	});
-});
-
-describe("Inspector — replay", () => {
-	it("does not render the Replay button while the conversation is loading", async () => {
-		const never = new Promise<Response>(() => {
-			// noop: intentionally never resolves to keep the query in `pending`.
-		});
-		server.use(http.get(CONVO_URL, () => never));
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-		await screen.findByLabelText(/^session$/i);
-		expect(screen.queryByRole("button", { name: /^replay session/i })).toBeNull();
-	});
-
-	it("does not render the Replay button when the conversation fails to load", async () => {
-		server.use(
-			http.get(CONVO_URL, () =>
-				HttpResponse.json({ error: "session_not_found", sessionId: "sess-1" }, { status: 404 }),
-			),
-		);
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-		await screen.findByText(/session not found/i);
-		expect(screen.queryByRole("button", { name: /^replay session/i })).toBeNull();
-	});
-
-	it("opens the replay modal seeded with the current session id when clicked", async () => {
-		server.use(
-			http.get(CONVO_URL, () =>
-				HttpResponse.json(makeConversation({ id: "sess-1", agentId: "agent-1" })),
-			),
-		);
-		const { ui } = renderWithRouter({ initialEntries: ["/sessions/sess-1"] });
-		render(ui);
-		const replay = await screen.findByRole("button", { name: /^replay session agent-1/i });
-		fireEvent.click(replay);
-		const dialog = await screen.findByRole("dialog");
-		expect(within(dialog).getByText("sess-1")).toBeTruthy();
+		const turn1List = screen.getByRole("list", { name: /Assertions for turn 1/i });
+		expect(turn1List.textContent).toMatch(/agent\.was_polite/);
+		expect(turn1List.textContent).toMatch(/did not greet/);
 	});
 });

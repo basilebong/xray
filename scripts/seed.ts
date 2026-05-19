@@ -1,336 +1,522 @@
-// Seed the running xray dev server with fake conversations so the UI has
-// something to render without a real agent loop. Two modes are seeded so a
-// developer sees one of each:
+// Seed the running xray dev server so the UI has something to render
+// without a real LiveKit-Python agent loop.
 //
-//   * text  — text-only, no audio (default custom-loop shape)
-//   * v2v   — text + real per-turn TTS audio for both user and agent turns
-//             so the realtime-replay engine has playable, intelligible audio
-//             to stream end-to-end. Requires VOICE=1 + OPENAI_API_KEY;
-//             without it the v2v session still renders but its realtime
-//             replay has no audio to forward.
+// Creates one Conversation, then N Replays via POST /v1/replays. For each
+// Replay it pushes a small synthetic OTLP/JSON batch with a mix of
+// vocabularies (xray.assertion, xray.judge, xray.turn, gen_ai.chat,
+// gen_ai.execute_tool, langfuse generation) so the inspector exercises
+// every panel, then uploads a single full-replay WAV that the client
+// segments by per-turn timestamps.
 //
 // Usage:
-//   pnpm dev                          # in one terminal — dev server on :8080
-//   pnpm seed                         # in another — POSTs events through /v1/sessions/:id/events
-//   VOICE=1 OPENAI_API_KEY=sk-... pnpm seed
-//                                     # synthesizes per-turn audio via OpenAI TTS for the
-//                                     # `v2v` session so playback is a real conversation,
-//                                     # not silence.
+//   pnpm dev                              # in one terminal
+//   pnpm seed                             # in another — falls back to sine
+//   OPENAI_API_KEY=sk-... pnpm seed       # synthesizes real TTS for each turn
 //
 // Override target via env: XRAY_BASE_URL=http://otherhost:9000 pnpm seed
-//
-// This is the same path a custom voice-agent loop uses (the JSONL fixture
-// docs in CLAUDE.md point at this endpoint), so the wire contract gets
-// exercised end-to-end rather than poked at via the store directly.
 
 import * as v from "valibot";
 
-import { isTruthy, synthesizeAndUpload } from "./lib/voice.ts";
+class SeedError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "SeedError";
+	}
+}
 
-// Env codec — parse once at startup per boundary-validation.md, not as
-// scattered untyped index lookups.
+class SeedRequestError extends SeedError {
+	readonly method: string;
+	readonly path: string;
+	readonly status: number;
+	readonly statusText: string;
+	readonly responseBody: string;
+	constructor(
+		method: string,
+		path: string,
+		status: number,
+		statusText: string,
+		responseBody: string,
+	) {
+		super(`${method} ${path} -> ${status} ${statusText}`);
+		this.name = "SeedRequestError";
+		this.method = method;
+		this.path = path;
+		this.status = status;
+		this.statusText = statusText;
+		this.responseBody = responseBody;
+	}
+}
+
 const EnvSchema = v.object({
 	XRAY_BASE_URL: v.optional(v.string()),
-	VOICE: v.optional(v.string()),
 	OPENAI_API_KEY: v.optional(v.string()),
 	OPENAI_TTS_MODEL: v.optional(v.string()),
-	OPENAI_TTS_VOICE: v.optional(v.string()),
 });
 const ENV = v.parse(EnvSchema, process.env);
 const BASE = ENV.XRAY_BASE_URL ?? "http://localhost:8080";
-
-const VOICE_ENABLED = isTruthy(ENV.VOICE);
-const TTS_MODEL = ENV.OPENAI_TTS_MODEL ?? "tts-1";
-// Two voices so user/agent turns sound different in playback.
-const USER_VOICE = "shimmer";
-const AGENT_VOICE = ENV.OPENAI_TTS_VOICE ?? "alloy";
-
-if (VOICE_ENABLED && ENV.OPENAI_API_KEY === undefined) {
-	console.error("VOICE=1 set but OPENAI_API_KEY is missing — pass it or unset VOICE.");
-	process.exit(1);
-}
-
-type Role = "user" | "agent" | "tool" | "system";
-
-/**
- * One conversation shape per audio strategy so a developer running `pnpm
- * seed` always has a working example of each:
- *
- *   text — no audio uploaded, ever
- *   v2v  — per-turn TTS audio in the format the realtime-replay engine
- *          can stream end-to-end (WAV) when VOICE=1 + OPENAI_API_KEY are
- *          set. The startup warning flags when VOICE is off so the
- *          operator isn't surprised that v2v replay has nothing to forward.
- */
-type SeedMode = "text" | "v2v";
-
-interface SeedToolCall {
-	idx: number;
-	name: string;
-	args: unknown;
-	result?: unknown;
-	latencyMs?: number;
-}
+const TTS_MODEL = ENV.OPENAI_TTS_MODEL ?? "gpt-4o-mini-tts";
 
 interface SeedTurn {
+	role: "user" | "agent";
+	text?: string;
+	key: string;
+}
+
+interface PlayedSegment {
 	idx: number;
-	role: Role;
-	text: string;
-	offsetMs: number;
-	responseLatencyMs?: number;
-	interrupted?: boolean;
-	interruptedAtMs?: number;
-	toolCalls?: SeedToolCall[];
+	role: "user" | "agent";
+	key: string;
+	transcript: string;
+	/** Offset from the replay's startedAt, in milliseconds. */
+	startMs: number;
+	/** End offset from the replay's startedAt, in milliseconds. */
+	endMs: number;
 }
 
-interface SeedSession {
-	id: string;
-	agentId: string;
-	mode: SeedMode;
-	startedAt: string;
-	durationMs?: number;
-	turns: SeedTurn[];
-}
+const CONVERSATION_ID = "demo-booking-happy-path";
+const CONVERSATION_VERSION = "v0001";
+const REPLAY_COUNT = 3;
 
-// Anchor everything to "now − 1h" so timestamps stay relevant when you reseed
-// next week. Each session's startedAt drifts back in 10-minute buckets so the
-// list view shows obvious ordering.
-const NOW = Date.now();
-const ANCHOR = NOW - 60 * 60 * 1000;
+const TURNS: SeedTurn[] = [
+	{ role: "user", text: "Hi, I'd like to book a table for two at 7pm.", key: "u0" },
+	{ role: "agent", key: "a0" },
+	{ role: "user", text: "Anything else I should know?", key: "u1" },
+	{ role: "agent", key: "a1" },
+];
 
-function isoAt(baseMs: number, offsetMs: number): string {
-	return new Date(baseMs + offsetMs).toISOString();
-}
-
-// Exactly one session per audio strategy — naming mirrors the `mode` so a
-// developer scanning the list view instantly sees which path each row
-// exercises. Tools and the live (no-`session_ended`) edge case are folded
-// into the two modes' content so the variety stays without multiplying rows.
-const SESSIONS: SeedSession[] = [
+// Shared source of truth for what the spans say AND what the TTS synthesizes.
+// Timings are millisecond offsets from the replay's startedAt; the audio
+// helper pads with silence between segments so the on-disk WAV's playhead
+// matches the spans.
+const PLAYED: PlayedSegment[] = [
 	{
-		// Text-only: tool-heavy support flow, no audio anywhere. Default
-		// shape for a custom-loop developer who doesn't ship audio.
-		id: "seed-mode-text",
-		agentId: "seed-mode-text",
-		mode: "text",
-		startedAt: isoAt(ANCHOR, 0),
-		durationMs: 42_000,
-		turns: [
-			{
-				idx: 0,
-				role: "user",
-				text: "Hi, my order #4821 hasn't shipped yet — can you check?",
-				offsetMs: 500,
-			},
-			{
-				idx: 1,
-				role: "agent",
-				text: "Let me look that up for you.",
-				offsetMs: 1_800,
-				responseLatencyMs: 620,
-				toolCalls: [
-					{
-						idx: 0,
-						name: "lookup_order",
-						args: { order_id: "4821" },
-						result: { status: "packing", carrier: "DHL", eta: "2026-05-19" },
-						latencyMs: 240,
-					},
-				],
-			},
-			{
-				idx: 2,
-				role: "agent",
-				text: "Your order is in packing and will ship via DHL with an ETA of May 19.",
-				offsetMs: 5_400,
-				responseLatencyMs: 780,
-			},
-			{
-				idx: 3,
-				role: "user",
-				text: "Great, thanks!",
-				offsetMs: 9_200,
-			},
-		],
+		idx: 0,
+		role: "user",
+		key: "u0",
+		transcript: "Hi, I'd like to book a table for two at 7pm.",
+		startMs: 0,
+		endMs: 2500,
 	},
 	{
-		// V2V: with VOICE=1 + OPENAI_API_KEY, every turn gets a real TTS WAV
-		// (PCM16 24 kHz mono) — the format OpenAI Realtime accepts as input,
-		// so this seeded session can be driven end-to-end through the realtime
-		// replay engine without re-recording anything.
-		id: "seed-mode-v2v",
-		agentId: "concierge-v2v",
-		mode: "v2v",
-		startedAt: isoAt(ANCHOR, 40 * 60 * 1000),
-		durationMs: 22_000,
-		turns: [
-			{
-				idx: 0,
-				role: "user",
-				text: "Book me a table for two at the bistro tonight at seven.",
-				offsetMs: 400,
-			},
-			{
-				idx: 1,
-				role: "agent",
-				text: "Got it — two people, seven PM. Checking availability now.",
-				offsetMs: 1_700,
-				responseLatencyMs: 720,
-				toolCalls: [
-					{
-						idx: 0,
-						name: "book_table",
-						args: { party_size: 2, time: "19:00" },
-						result: { confirmed: true, reference: "BIS-9821" },
-						latencyMs: 380,
-					},
-				],
-			},
-			{
-				idx: 2,
-				role: "agent",
-				text: "Confirmed — reference BIS-9821. You'll get an SMS shortly.",
-				offsetMs: 6_200,
-				responseLatencyMs: 480,
-			},
-			{
-				idx: 3,
-				role: "user",
-				text: "Perfect, thanks.",
-				offsetMs: 10_500,
-			},
-		],
+		idx: 1,
+		role: "agent",
+		key: "a0",
+		transcript: "Confirmed — two at 7pm. Anything else I can help with?",
+		startMs: 3000,
+		endMs: 6500,
+	},
+	{
+		idx: 2,
+		role: "user",
+		key: "u1",
+		transcript: "Anything else I should know?",
+		startMs: 7000,
+		endMs: 9000,
+	},
+	{
+		idx: 3,
+		role: "agent",
+		key: "a1",
+		transcript: "We hold reservations for 15 minutes past your time — see you then.",
+		startMs: 9500,
+		endMs: 13000,
 	},
 ];
 
-interface PostOptions {
-	sessionId: string;
-	body: { type: string } & Record<string, unknown>;
+const TTS_VOICE_FOR_ROLE: Record<"user" | "agent", string> = {
+	user: "alloy",
+	agent: "verse",
+};
+
+async function main() {
+	await postConversation();
+	for (let i = 0; i < REPLAY_COUNT; i++) {
+		const replayId = await postReplay(i);
+		await pushOtlp(replayId, i);
+		await uploadReplayAudio(replayId, i);
+		await patchReplay(replayId, i);
+	}
+	console.info(`seeded ${REPLAY_COUNT} replays under ${CONVERSATION_ID}`);
 }
 
-async function postEvent({ sessionId, body }: PostOptions): Promise<void> {
-	const res = await fetch(`${BASE}/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
+async function postConversation() {
+	const body = {
+		id: CONVERSATION_ID,
+		version: CONVERSATION_VERSION,
+		title: "Books a table for two — happy path",
+		turns: TURNS,
+	};
+	const res = await fetch(`${BASE}/v1/conversations`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(body),
 	});
 	if (!res.ok) {
-		const text = await res.text();
-		throw new Error(`POST ${sessionId} ${body.type} → ${res.status}: ${text}`);
-	}
-}
-
-async function seedSession(session: SeedSession): Promise<void> {
-	await postEvent({
-		sessionId: session.id,
-		body: {
-			type: "session_started",
-			agentId: session.agentId,
-			startedAt: session.startedAt,
-		},
-	});
-	const baseMs = Date.parse(session.startedAt);
-	for (const turn of session.turns) {
-		await postEvent({
-			sessionId: session.id,
-			body: {
-				type: "turn_completed",
-				idx: turn.idx,
-				role: turn.role,
-				text: turn.text,
-				timestamp: isoAt(baseMs, turn.offsetMs),
-				...(turn.responseLatencyMs !== undefined
-					? { responseLatencyMs: turn.responseLatencyMs }
-					: {}),
-				...(turn.interrupted !== undefined ? { interrupted: turn.interrupted } : {}),
-				...(turn.interruptedAtMs !== undefined ? { interruptedAtMs: turn.interruptedAtMs } : {}),
-			},
-		});
-		for (const call of turn.toolCalls ?? []) {
-			await postEvent({
-				sessionId: session.id,
-				body: {
-					type: "tool_called",
-					turnIdx: turn.idx,
-					idx: call.idx,
-					name: call.name,
-					args: call.args,
-					...(call.result !== undefined ? { result: call.result } : {}),
-					...(call.latencyMs !== undefined ? { latencyMs: call.latencyMs } : {}),
-				},
-			});
-		}
-		if (
-			(turn.role === "user" || turn.role === "agent") &&
-			session.mode === "v2v" &&
-			VOICE_ENABLED
-		) {
-			await runVoice(session.id, turn.idx, turn.role, turn.text);
-		}
-	}
-	if (session.durationMs !== undefined) {
-		await postEvent({
-			sessionId: session.id,
-			body: {
-				type: "session_ended",
-				endedAt: isoAt(baseMs, session.durationMs),
-				durationMs: session.durationMs,
-			},
-		});
-	}
-}
-
-async function runVoice(
-	sessionId: string,
-	turnIdx: number,
-	role: "user" | "agent",
-	text: string,
-): Promise<void> {
-	// The guard at module init narrowed OPENAI_API_KEY to non-undefined when
-	// VOICE_ENABLED; the `?? ""` here is purely a type guard.
-	const apiKey = ENV.OPENAI_API_KEY ?? "";
-	const res = await synthesizeAndUpload({
-		apiKey,
-		xrayBase: BASE,
-		sessionId,
-		turnIdx,
-		text,
-		ttsModel: TTS_MODEL,
-		voice: role === "user" ? USER_VOICE : AGENT_VOICE,
-	});
-	if (!res.ok) {
-		console.warn(`  ! audio for ${sessionId} turn ${turnIdx} (${role}) failed: ${res.reason}`);
-	}
-}
-
-async function main(): Promise<void> {
-	console.info(
-		`Seeding ${SESSIONS.length} sessions to ${BASE}${VOICE_ENABLED ? " (voice on)" : ""}`,
-	);
-	const v2vSession = SESSIONS.find((s) => s.mode === "v2v");
-	if (v2vSession !== undefined && !VOICE_ENABLED) {
-		console.warn(
-			`! ${v2vSession.id} is mode=v2v but VOICE=1 is not set — the session will seed with no audio, ` +
-				`so the realtime-replay engine will have nothing to forward. Re-run with ` +
-				`VOICE=1 OPENAI_API_KEY=sk-... pnpm seed to get a real audio conversation.`,
+		throw new SeedRequestError(
+			"POST",
+			"/v1/conversations",
+			res.status,
+			res.statusText,
+			await res.text(),
 		);
 	}
-	// Quick reachability check so the failure mode is obvious if the dev
-	// server isn't running, instead of N opaque fetch errors.
-	try {
-		const ping = await fetch(`${BASE}/healthz`);
-		if (!ping.ok) throw new Error(`healthz returned ${ping.status}`);
-	} catch (cause) {
-		console.error(`Cannot reach xray at ${BASE} — is \`pnpm dev\` running?`);
-		console.error(cause);
-		process.exit(1);
-	}
-
-	for (const session of SESSIONS) {
-		await seedSession(session);
-		console.info(`  + ${session.id} (${session.turns.length} turns)`);
-	}
-	console.info("Done. Open http://localhost:8080 to see them.");
 }
 
-await main();
+async function postReplay(idx: number): Promise<string> {
+	const body = {
+		conversationId: CONVERSATION_ID,
+		conversationVersion: CONVERSATION_VERSION,
+		modality: "voice",
+		runConfig: {
+			model: idx % 2 === 0 ? "gpt-4o" : "gpt-4o-mini",
+			temperature: 0.3 + idx * 0.2,
+		},
+	};
+	const res = await fetch(`${BASE}/v1/replays`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (!res.ok) {
+		throw new SeedRequestError("POST", "/v1/replays", res.status, res.statusText, await res.text());
+	}
+	const parsed = v.parse(v.object({ id: v.string() }), await res.json());
+	return parsed.id;
+}
+
+async function pushOtlp(replayId: string, idx: number) {
+	const replayStartMs = Date.UTC(2026, 4, 18 + idx, 12, 0, 0);
+	const lastEnd = PLAYED.at(-1)?.endMs ?? 0;
+	const judgeStart = lastEnd + 100;
+	const body = {
+		resourceSpans: [
+			{
+				resource: {
+					attributes: [
+						kv("xray.replay.id", replayId),
+						kv("xray.conversation.id", CONVERSATION_ID),
+						kv("xray.conversation.version", CONVERSATION_VERSION),
+						kv("xray.modality", "voice"),
+					],
+				},
+				scopeSpans: [
+					{
+						scope: { name: "seed", attributes: [] },
+						spans: [
+							// xray.turn spans — one per played segment. These are what
+							// the inspector slices the full-replay WAV by.
+							...PLAYED.map((p) =>
+								span({
+									name: "xray.turn",
+									start: replayStartMs + p.startMs,
+									end: replayStartMs + p.endMs,
+									attrs: {
+										"xray.turn.idx": p.idx,
+										"xray.turn.role": p.role,
+										"xray.turn.key": p.key,
+										"xray.turn.transcript": p.transcript,
+									},
+								}),
+							),
+							// Per-turn assertion on the first agent reply.
+							span({
+								name: "xray.assertion",
+								start: replayStartMs + 6500,
+								end: replayStartMs + 6501,
+								attrs: {
+									"xray.turn.idx": 1,
+									"xray.assertion.name": "confirms_booking",
+									"xray.assertion.status": idx === 1 ? "failed" : "passed",
+								},
+							}),
+							// Per-replay judge.
+							span({
+								name: "xray.judge",
+								start: replayStartMs + judgeStart,
+								end: replayStartMs + judgeStart + 400,
+								attrs: {
+									"xray.judge.status": idx === 1 ? "failed" : "passed",
+									"xray.judge.score": 100 - idx * 12,
+									"xray.judge.reason":
+										idx === 1
+											? "Agent omitted the confirmation phrase"
+											: "Agent confirmed and offered follow-up",
+								},
+							}),
+							// gen_ai chat span for the first agent turn.
+							span({
+								name: "chat gpt-4o",
+								start: replayStartMs + 3000,
+								end: replayStartMs + 6000,
+								attrs: {
+									"gen_ai.operation.name": "chat",
+									"gen_ai.system": "openai",
+									"gen_ai.request.model": "gpt-4o",
+									"gen_ai.usage.input_tokens": 240 + idx,
+									"gen_ai.usage.output_tokens": 88 + idx,
+								},
+							}),
+							// gen_ai tool call.
+							span({
+								name: "execute_tool reserve_table",
+								start: replayStartMs + 3500,
+								end: replayStartMs + 3900,
+								attrs: {
+									"gen_ai.operation.name": "execute_tool",
+									"gen_ai.tool.name": "reserve_table",
+									"gen_ai.tool.arguments": JSON.stringify({ party: 2, time: "19:00" }),
+									"gen_ai.tool.result": JSON.stringify({ ok: true, confirmation: "AB123" }),
+								},
+							}),
+							// Langfuse generation — surfaces a different provider for diversity.
+							span({
+								name: "anthropic-summarize",
+								start: replayStartMs + 9700,
+								end: replayStartMs + 9900,
+								attrs: {
+									"langfuse.observation.type": "generation",
+									"langfuse.observation.provider": "anthropic",
+									"langfuse.observation.model.name": "claude-3-5-sonnet",
+									"langfuse.observation.usage_details.input": 18,
+									"langfuse.observation.usage_details.output": 7,
+								},
+							}),
+						],
+					},
+				],
+			},
+		],
+	};
+	const res = await fetch(`${BASE}/v1/otlp/v1/traces`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (!res.ok) {
+		throw new SeedRequestError(
+			"POST",
+			"/v1/otlp/v1/traces",
+			res.status,
+			res.statusText,
+			await res.text(),
+		);
+	}
+}
+
+// One audio file per replay (the full mixdown). The UI slices it by
+// `replay_turns.started_at`/`ended_at` from the xray.turn spans pushed
+// above, so this single WAV plays back per-turn segments in the inspector.
+//
+// When OPENAI_API_KEY is set, each segment's `transcript` is synthesized
+// via OpenAI's `/v1/audio/speech` (PCM, 24 kHz mono) and the segments are
+// concatenated with silence padding so the playhead lines up with the
+// span timings. Without a key, falls back to a per-turn sine tone — still
+// audibly turn-shaped but not speech.
+async function uploadReplayAudio(replayId: string, replayIdx: number) {
+	const wav = ENV.OPENAI_API_KEY
+		? await synthesizeReplayWavViaOpenAI(ENV.OPENAI_API_KEY)
+		: synthesizeReplayWavViaSine(replayIdx);
+	const res = await fetch(`${BASE}/v1/replays/${replayId}/audio`, {
+		method: "POST",
+		headers: { "content-type": "audio/wav" },
+		body: new Blob([wav], { type: "audio/wav" }),
+	});
+	if (!res.ok) {
+		throw new SeedRequestError(
+			"POST",
+			`/v1/replays/${replayId}/audio`,
+			res.status,
+			res.statusText,
+			await res.text(),
+		);
+	}
+}
+
+async function patchReplay(replayId: string, idx: number) {
+	const body = {
+		status: idx === 2 ? "failed" : "completed",
+		failureReason: idx === 2 ? "runtime_error" : null,
+		finishedAt: new Date(Date.UTC(2026, 4, 18 + idx, 12, 0, 15)).toISOString(),
+		transcript: PLAYED.map((p) => `${p.role === "user" ? "User" : "Agent"}: ${p.transcript}`).join(
+			"\n",
+		),
+	};
+	const res = await fetch(`${BASE}/v1/replays/${replayId}`, {
+		method: "PATCH",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (!res.ok) {
+		throw new SeedRequestError(
+			"PATCH",
+			`/v1/replays/${replayId}`,
+			res.status,
+			res.statusText,
+			await res.text(),
+		);
+	}
+}
+
+// --- audio helpers ---
+
+const TTS_SAMPLE_RATE = 24_000; // OpenAI TTS PCM is fixed at 24 kHz mono.
+const SINE_SAMPLE_RATE = 16_000;
+
+/**
+ * TTS each segment, drop the bytes at the right offset of a single
+ * 24 kHz mono PCM buffer, render to WAV.
+ *
+ * Each clip is trimmed to its span's slot length so the on-disk
+ * playhead matches the span timestamps the inspector seeks by. If TTS
+ * runs longer than the slot the tail is dropped; if shorter, the slot
+ * pads with silence. Trimming (rather than expanding the buffer) keeps
+ * playback aligned with `replay_turns.started_at`/`ended_at` — that
+ * alignment is the whole reason this script uploads one mixdown
+ * instead of N per-turn clips.
+ */
+async function synthesizeReplayWavViaOpenAI(apiKey: string): Promise<ArrayBuffer> {
+	const sampleRate = TTS_SAMPLE_RATE;
+	const totalSamples = Math.round(((PLAYED.at(-1)?.endMs ?? 0) / 1000) * sampleRate);
+	const mix = new Int16Array(totalSamples);
+	for (const seg of PLAYED) {
+		const samples = await ttsToPcm(apiKey, seg.transcript, TTS_VOICE_FOR_ROLE[seg.role]);
+		const startSamples = Math.round((seg.startMs / 1000) * sampleRate);
+		const endSamples = Math.round((seg.endMs / 1000) * sampleRate);
+		const slotLength = Math.max(0, endSamples - startSamples);
+		const clipLength = Math.min(samples.length, slotLength, totalSamples - startSamples);
+		if (clipLength > 0) mix.set(samples.subarray(0, clipLength), startSamples);
+	}
+	return wavFromPcm(mix, sampleRate);
+}
+
+async function ttsToPcm(apiKey: string, text: string, voice: string): Promise<Int16Array> {
+	const res = await fetch("https://api.openai.com/v1/audio/speech", {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			authorization: `Bearer ${apiKey}`,
+		},
+		body: JSON.stringify({
+			model: TTS_MODEL,
+			voice,
+			input: text,
+			// PCM = raw 16-bit signed little-endian, 24 kHz mono. Trivial
+			// to concatenate without an audio-decoding library.
+			response_format: "pcm",
+		}),
+	});
+	if (!res.ok) {
+		throw new SeedRequestError(
+			"POST",
+			"https://api.openai.com/v1/audio/speech",
+			res.status,
+			res.statusText,
+			await res.text(),
+		);
+	}
+	const buf = await res.arrayBuffer();
+	return new Int16Array(buf);
+}
+
+/**
+ * Fallback when no OpenAI key is configured. Different sine frequency
+ * per replay so the three runs sound different, with a per-segment
+ * envelope so turn boundaries are audible.
+ */
+function synthesizeReplayWavViaSine(replayIdx: number): ArrayBuffer {
+	const sampleRate = SINE_SAMPLE_RATE;
+	const totalSamples = Math.round(((PLAYED.at(-1)?.endMs ?? 0) / 1000) * sampleRate);
+	const mix = new Int16Array(totalSamples);
+	const baseFreq = 220 + replayIdx * 110;
+	for (const seg of PLAYED) {
+		const start = Math.round((seg.startMs / 1000) * sampleRate);
+		const end = Math.round((seg.endMs / 1000) * sampleRate);
+		// User turns ride at baseFreq, agent turns up a fifth.
+		const freq = seg.role === "user" ? baseFreq : baseFreq * 1.5;
+		const amplitude = 0.25 * 0x7fff;
+		for (let i = start; i < end && i < totalSamples; i++) {
+			const sample = Math.round(
+				amplitude * Math.sin((2 * Math.PI * freq * (i - start)) / sampleRate),
+			);
+			mix[i] = sample;
+		}
+	}
+	return wavFromPcm(mix, sampleRate);
+}
+
+/**
+ * Wrap raw 16-bit signed PCM samples (mono) in a minimal RIFF/WAV
+ * container. No external dep — the format is small enough to spell out
+ * by hand and the resulting file plays in every browser.
+ */
+function wavFromPcm(samples: Int16Array, sampleRate: number): ArrayBuffer {
+	const bytesPerSample = 2;
+	const dataBytes = samples.length * bytesPerSample;
+	const buffer = new ArrayBuffer(44 + dataBytes);
+	const view = new DataView(buffer);
+
+	writeAscii(view, 0, "RIFF");
+	view.setUint32(4, 36 + dataBytes, true);
+	writeAscii(view, 8, "WAVE");
+	writeAscii(view, 12, "fmt ");
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true); // PCM format
+	view.setUint16(22, 1, true); // mono
+	view.setUint32(24, sampleRate, true);
+	view.setUint32(28, sampleRate * bytesPerSample, true);
+	view.setUint16(32, bytesPerSample, true);
+	view.setUint16(34, 16, true);
+	writeAscii(view, 36, "data");
+	view.setUint32(40, dataBytes, true);
+
+	for (let i = 0; i < samples.length; i++) {
+		const sample = samples[i] ?? 0;
+		view.setInt16(44 + i * bytesPerSample, sample, true);
+	}
+	return buffer;
+}
+
+function writeAscii(view: DataView, offset: number, ascii: string): void {
+	for (let i = 0; i < ascii.length; i++) view.setUint8(offset + i, ascii.charCodeAt(i));
+}
+
+// --- otlp wire helpers ---
+
+function kv(key: string, value: string | number | boolean) {
+	if (typeof value === "string") return { key, value: { stringValue: value } };
+	if (typeof value === "boolean") return { key, value: { boolValue: value } };
+	if (Number.isInteger(value)) return { key, value: { intValue: String(value) } };
+	return { key, value: { doubleValue: value } };
+}
+
+function span(opts: {
+	name: string;
+	start: number;
+	end: number;
+	attrs: Record<string, string | number | boolean>;
+}) {
+	return {
+		traceId: randomHex(32),
+		spanId: randomHex(16),
+		name: opts.name,
+		startTimeUnixNano: String(BigInt(opts.start) * 1_000_000n),
+		endTimeUnixNano: String(BigInt(opts.end) * 1_000_000n),
+		attributes: Object.entries(opts.attrs).map(([k, v2]) => kv(k, v2)),
+	};
+}
+
+function randomHex(length: number): string {
+	// crypto.randomUUID yields 32 hex chars; loop for the 16-char case rather
+	// than slicing because the floating-point accumulator the previous
+	// implementation used overflowed past 2^53 on long span names and
+	// silently collided on (replay_id, span_id), tripping the spans
+	// onConflictDoNothing path.
+	let out = "";
+	while (out.length < length) out += crypto.randomUUID().replace(/-/g, "");
+	return out.slice(0, length);
+}
+
+main().catch((err) => {
+	console.error(err);
+	process.exit(1);
+});

@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "xray-py"
+version = "0.0.1"
+description = "Python SDK for xray — replay/eval for LiveKit voice agents"
+readme = "README.md"
+license = { text = "Elastic-2.0" }
+requires-python = ">=3.11"  # NotRequired + assert_never are stdlib `typing` in 3.11+
+authors = [{ name = "Basile Bong" }]
+keywords = ["livekit", "voice-agents", "eval", "opentelemetry", "replay"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: Other/Proprietary License",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Testing",
+]
+
+dependencies = [
+  "httpx>=0.27",
+  "opentelemetry-api>=1.30",
+  "opentelemetry-sdk>=1.30",
+  "opentelemetry-exporter-otlp-proto-http>=1.30",
+  "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+livekit = [
+  "livekit>=1.0",
+  "livekit-api>=1.0",
+]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "pyright>=1.1.380",
+  "ruff>=0.6",
+  "respx>=0.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/xray-eval/xray"
+Repository = "https://github.com/xray-eval/xray"
+Issues = "https://github.com/xray-eval/xray/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xray"]
+
+# `py.typed` ships in the wheel so consumers' pyright/mypy inherits our
+# inline annotations (PEP 561).
+[tool.hatch.build.targets.wheel.force-include]
+"src/xray/py.typed" = "xray/py.typed"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["I", "B", "UP", "SIM"]
+
+# Strict-mode gate. Zero diagnostics; `# type: ignore` and `cast(...)`
+# are banned in src/ + tests/. See sdk/python/.claude/rules/no-any.md.
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "strict"
+useLibraryCodeForTypes = true
+reportUnnecessaryTypeIgnoreComment = "error"
+reportImplicitOverride = "error"
+
+# OTEL ships with partial type stubs; this would fire on every
+# `from opentelemetry import …`. Not our bug to fix.
+reportMissingTypeStubs = "none"
+
+# `tests/` legitimately:
+#  - exercises module-private helpers (_TurnSegment, _upsample_2x_int16, _tracer);
+#  - defines pytest fixtures whose names pyright sees as unused (the
+#    framework resolves them by string lookup);
+#  - uses respx, whose `CallList` subclasses `unittest.mock.NonCallableMock` —
+#    every `call.request.content` chain surfaces as `Unknown` no matter how
+#    carefully we narrow. We contain the looseness via `_raw_body` /
+#    `_request_headers` helpers in test_orchestrator.py; this relaxation
+#    just acknowledges the inbound `route.calls[idx]` itself is Unknown.
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+reportPrivateUsage = "none"
+reportUnusedFunction = "none"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
