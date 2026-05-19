@@ -4,20 +4,28 @@ the SDK's lifecycle calls."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 import respx
 
 from xray import Conversation, Turn, expect_agent_turn, run
-from xray.conversation import AgentResponse, JudgeOutcome, ReplayResult
+from xray.conversation import AgentResponse, JudgeOutcome
 from xray.runtime.base import Runtime, RuntimeResult
 
 
 class StubRuntime(Runtime):
     """Returns canned agent responses without touching LiveKit."""
 
-    def __init__(self, responses: list[AgentResponse]) -> None:
+    def __init__(
+        self,
+        responses: list[AgentResponse],
+        *,
+        full_audio_path: str | None = None,
+    ) -> None:
         self.responses = responses
+        self.full_audio_path = full_audio_path
         self.bound: dict[str, str] | None = None
         self.closed = False
 
@@ -29,7 +37,9 @@ class StubRuntime(Runtime):
         }
 
     async def run(self, conversation: Conversation) -> RuntimeResult:
-        return RuntimeResult(responses=self.responses)
+        return RuntimeResult(
+            responses=self.responses, full_audio_path=self.full_audio_path
+        )
 
     async def aclose(self) -> None:
         self.closed = True
@@ -196,3 +206,133 @@ def test_assertion_outcomes(passes, expected):
 
     result = run(conversation=conv, runtime=runtime, xray_url="http://xray.local")
     assert result.assertions[0].status == expected
+
+
+@respx.mock
+def test_audio_uploaded_when_runtime_returns_full_audio_path(tmp_path: Path):
+    """When the runtime hands back a mixdown WAV, the orchestrator POSTs
+    its bytes to /v1/replays/:id/audio with the audio/wav content type."""
+    wav = tmp_path / "rep.wav"
+    wav_bytes = b"RIFF\0\0\0\0WAVEfmt ...."  # any bytes — server validates format
+    wav.write_bytes(wav_bytes)
+
+    conv = Conversation(id="x", turns=[Turn.user("hi", key="u0")])
+    runtime = StubRuntime(
+        responses=[AgentResponse(transcript="")],
+        full_audio_path=str(wav),
+    )
+
+    respx.post("http://xray.local/v1/conversations").mock(
+        return_value=httpx.Response(200, json=conv.to_spec_payload())
+    )
+    respx.post("http://xray.local/v1/replays").mock(
+        return_value=httpx.Response(201, json={"id": "00000000-0000-0000-0000-0000000000bb"})
+    )
+    audio_upload = respx.post(
+        "http://xray.local/v1/replays/00000000-0000-0000-0000-0000000000bb/audio"
+    ).mock(return_value=httpx.Response(200, json={"ok": True}))
+    respx.patch(
+        "http://xray.local/v1/replays/00000000-0000-0000-0000-0000000000bb"
+    ).mock(return_value=httpx.Response(200, json={}))
+
+    result = run(conversation=conv, runtime=runtime, xray_url="http://xray.local")
+    assert audio_upload.called
+    upload_call = audio_upload.calls[0]
+    assert upload_call.request.headers["content-type"] == "audio/wav"
+    assert upload_call.request.content == wav_bytes
+    assert result.status == "completed"
+
+
+@respx.mock
+def test_audio_upload_skipped_when_runtime_returns_no_path():
+    """No full_audio_path on RuntimeResult ⇒ no POST to .../audio."""
+    conv = Conversation(id="x", turns=[Turn.user("hi", key="u0")])
+    runtime = StubRuntime(responses=[AgentResponse(transcript="")])
+
+    respx.post("http://xray.local/v1/conversations").mock(
+        return_value=httpx.Response(200, json=conv.to_spec_payload())
+    )
+    respx.post("http://xray.local/v1/replays").mock(
+        return_value=httpx.Response(201, json={"id": "00000000-0000-0000-0000-0000000000cc"})
+    )
+    audio_upload = respx.post(
+        "http://xray.local/v1/replays/00000000-0000-0000-0000-0000000000cc/audio"
+    ).mock(return_value=httpx.Response(200, json={"ok": True}))
+    respx.patch(
+        "http://xray.local/v1/replays/00000000-0000-0000-0000-0000000000cc"
+    ).mock(return_value=httpx.Response(200, json={}))
+
+    run(conversation=conv, runtime=runtime, xray_url="http://xray.local")
+    assert not audio_upload.called
+
+
+@respx.mock
+def test_audio_upload_failure_demotes_replay_to_failed(tmp_path: Path):
+    """A 500 from the audio endpoint should mark the replay failed rather
+    than silently losing the row."""
+    wav = tmp_path / "rep.wav"
+    wav.write_bytes(b"RIFF\0\0\0\0WAVE")
+
+    conv = Conversation(id="x", turns=[Turn.user("hi", key="u0")])
+    runtime = StubRuntime(
+        responses=[AgentResponse(transcript="")],
+        full_audio_path=str(wav),
+    )
+
+    respx.post("http://xray.local/v1/conversations").mock(
+        return_value=httpx.Response(200, json=conv.to_spec_payload())
+    )
+    respx.post("http://xray.local/v1/replays").mock(
+        return_value=httpx.Response(201, json={"id": "00000000-0000-0000-0000-0000000000dd"})
+    )
+    respx.post(
+        "http://xray.local/v1/replays/00000000-0000-0000-0000-0000000000dd/audio"
+    ).mock(return_value=httpx.Response(500, json={"error": "store_failure"}))
+    patch_replay = respx.patch(
+        "http://xray.local/v1/replays/00000000-0000-0000-0000-0000000000dd"
+    ).mock(return_value=httpx.Response(200, json={}))
+
+    result = run(conversation=conv, runtime=runtime, xray_url="http://xray.local")
+    assert result.status == "failed"
+    body = patch_replay.calls[0].request.content.decode()
+    assert '"status":"failed"' in body
+
+
+@respx.mock
+def test_audio_upload_caps_at_50mib_locally(tmp_path: Path):
+    """Bytes over MAX_AUDIO_BYTES are rejected before they hit the wire,
+    so devs see a typed error instead of waiting on a 413 from the server.
+    """
+    from xray.errors import AudioTooLargeError
+    from xray.orchestrator import MAX_AUDIO_BYTES
+
+    wav = tmp_path / "huge.wav"
+    wav.write_bytes(b"\0" * (MAX_AUDIO_BYTES + 1))
+
+    conv = Conversation(id="x", turns=[Turn.user("hi", key="u0")])
+    runtime = StubRuntime(
+        responses=[AgentResponse(transcript="")],
+        full_audio_path=str(wav),
+    )
+
+    respx.post("http://xray.local/v1/conversations").mock(
+        return_value=httpx.Response(200, json=conv.to_spec_payload())
+    )
+    respx.post("http://xray.local/v1/replays").mock(
+        return_value=httpx.Response(201, json={"id": "00000000-0000-0000-0000-0000000000ee"})
+    )
+    audio_upload = respx.post(
+        "http://xray.local/v1/replays/00000000-0000-0000-0000-0000000000ee/audio"
+    ).mock(return_value=httpx.Response(200, json={"ok": True}))
+    patch_replay = respx.patch(
+        "http://xray.local/v1/replays/00000000-0000-0000-0000-0000000000ee"
+    ).mock(return_value=httpx.Response(200, json={}))
+
+    result = run(conversation=conv, runtime=runtime, xray_url="http://xray.local")
+    assert not audio_upload.called
+    assert result.status == "failed"
+    body = patch_replay.calls[0].request.content.decode()
+    assert '"failureReason":"runtime_error"' in body
+    # Sanity: the typed error class is still importable for SDK users
+    # who catch it explicitly.
+    assert AudioTooLargeError.__name__ == "AudioTooLargeError"

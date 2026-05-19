@@ -3,8 +3,9 @@
 1. POST the Conversation (idempotent upsert).
 2. POST the Replay, get back ``replay_id``.
 3. Bind the runtime + run it.
-4. Evaluate per-turn assertions, then the per-replay judge (if any).
-5. PATCH the Replay row with final status + judge.
+4. Upload the runtime's mixdown WAV (if produced).
+5. Evaluate per-turn assertions, then the per-replay judge (if any).
+6. PATCH the Replay row with final status + judge.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import asyncio
 import inspect
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -25,7 +27,8 @@ from xray.conversation import (
     ReplayResult,
     TurnRecord,
 )
-from xray.runtime.base import Runtime
+from xray.errors import AudioTooLargeError, XrayError
+from xray.runtime.base import Runtime, RuntimeResult
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,11 @@ logger = logging.getLogger(__name__)
 _FAILURE_REASONS = frozenset(
     {"agent_not_joined", "runtime_error", "audio_missing", "sdk_aborted", "other"}
 )
+
+# Mirrors MAX_AUDIO_BYTES in src/server/audio/audio.types.ts. The server
+# enforces the cap independently; we surface a typed error before sending
+# bytes the server will reject anyway.
+MAX_AUDIO_BYTES = 50 * 1024 * 1024
 
 
 @dataclass
@@ -102,20 +110,50 @@ async def run_async(
                 conversation_version=conversation.version,
             )
 
-        # 4. Run the runtime.
+        # 4. Run the runtime. The broad fallback exists because we're
+        #    orchestrating dev-provided code (runtime subclass) and a
+        #    failed Replay must always be PATCHed — otherwise the row
+        #    stays `running` forever and the inspector misleads.
         status: str = "completed"
         failure_reason: str | None = None
-        runtime_result = None
+        runtime_result: RuntimeResult | None = None
         try:
             runtime_result = await runtime.run(conversation)
-        except Exception as e:  # noqa: BLE001
+        except XrayError as e:
+            logger.exception("runtime failed during replay %s", replay_id)
+            status = "failed"
+            failure_reason = e.failure_reason
+        except Exception as e:
             logger.exception("runtime failed during replay %s", replay_id)
             status = "failed"
             failure_reason = _classify_failure(e)
         finally:
             await runtime.aclose()
 
-        # 5. Evaluate per-turn assertions on the runtime's recorded responses.
+        # 5. Upload the full-replay mixdown if the runtime produced one.
+        #    Failure here demotes the replay to `failed` rather than
+        #    losing the row — the assertions still get persisted below.
+        if (
+            runtime_result is not None
+            and runtime_result.full_audio_path is not None
+            and status == "completed"
+        ):
+            try:
+                await _upload_replay_audio(
+                    client=client,
+                    replay_id=replay_id,
+                    audio_path=runtime_result.full_audio_path,
+                )
+            except XrayError as e:
+                logger.exception("audio upload failed for replay %s", replay_id)
+                status = "failed"
+                failure_reason = e.failure_reason
+            except Exception as e:
+                logger.exception("audio upload failed for replay %s", replay_id)
+                status = "failed"
+                failure_reason = _classify_failure(e)
+
+        # 6. Evaluate per-turn assertions on the runtime's recorded responses.
         assertions: list[AssertionOutcome] = []
         responses = runtime_result.responses if runtime_result is not None else []
         turn_records: list[TurnRecord] = []
@@ -125,15 +163,16 @@ async def run_async(
                 role=turn.role,
                 key=turn.key,
                 transcript=response.transcript if response is not None else None,
-                audio_path=response.audio_path if response is not None else None,
             )
             if turn.assertion is not None and response is not None:
-                outcome = await _evaluate_assertion(turn.assertion, turn.assertion_name or f"turn_{idx}", response)
+                outcome = await _evaluate_assertion(
+                    turn.assertion, turn.assertion_name or f"turn_{idx}", response
+                )
                 record.assertion = outcome
                 assertions.append(outcome)
             turn_records.append(record)
 
-        # 6. Run the judge (if any) against the full replay.
+        # 7. Run the judge (if any) against the full replay.
         judge_outcome: JudgeOutcome | None = None
         if conversation.judge is not None and status == "completed":
             replay_result = ReplayResult(
@@ -144,7 +183,7 @@ async def run_async(
             )
             judge_outcome = await _evaluate_judge(conversation.judge, replay_result)
 
-        # 7. PATCH the Replay with the final outcome.
+        # 8. PATCH the Replay with the final outcome.
         patch_body: dict[str, Any] = {"status": status}
         if failure_reason is not None:
             patch_body["failureReason"] = failure_reason
@@ -168,11 +207,29 @@ async def run_async(
         )
 
 
+async def _upload_replay_audio(
+    *, client: httpx.AsyncClient, replay_id: str, audio_path: str
+) -> None:
+    """POST a WAV mixdown to the replay-audio endpoint. Caps at
+    MAX_AUDIO_BYTES locally so we surface ``AudioTooLargeError`` instead
+    of a 413 from the server."""
+    path = Path(audio_path)
+    bytes_ = path.read_bytes()
+    if len(bytes_) > MAX_AUDIO_BYTES:
+        raise AudioTooLargeError(byte_size=len(bytes_), max_bytes=MAX_AUDIO_BYTES)
+    response = await client.post(
+        f"/v1/replays/{replay_id}/audio",
+        content=bytes_,
+        headers={"content-type": "audio/wav"},
+    )
+    response.raise_for_status()
+
+
 def _classify_failure(e: BaseException) -> str:
-    """Map a runtime exception to one of the server's failureReason picklist
-    values. Runtimes that want to signal a specific reason (`agent_not_joined`,
-    `audio_missing`, …) raise with that string as the message; anything else
-    falls back to `runtime_error`."""
+    """Map a raw exception's message onto one of the server's
+    ``failureReason`` picklist values; anything else falls back to
+    ``runtime_error``. Typed :class:`XrayError` instances are handled
+    earlier and don't reach this function."""
     message = str(e).strip()
     return message if message in _FAILURE_REASONS else "runtime_error"
 
@@ -182,16 +239,19 @@ async def _evaluate_assertion(
     name: str,
     response: AgentResponse,
 ) -> AssertionOutcome:
+    # Broad except is intentional: assertions are dev-authored lambdas
+    # whose exception types we don't know; raising counts as 'errored'.
     try:
         result = predicate(response)
         if inspect.isawaitable(result):
             result = await result
         return AssertionOutcome(name=name, status="passed" if result else "failed")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return AssertionOutcome(name=name, status="errored", message=str(e))
 
 
 async def _evaluate_judge(predicate: Any, replay: ReplayResult) -> JudgeOutcome:
+    # See `_evaluate_assertion` — same rationale for the broad except.
     try:
         result = predicate(replay)
         if inspect.isawaitable(result):
@@ -199,5 +259,5 @@ async def _evaluate_judge(predicate: Any, replay: ReplayResult) -> JudgeOutcome:
         if isinstance(result, JudgeOutcome):
             return result
         return JudgeOutcome(status="errored", error="judge did not return a JudgeOutcome")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return JudgeOutcome(status="errored", error=str(e))

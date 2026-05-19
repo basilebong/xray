@@ -19,7 +19,7 @@ Role = Literal["user", "agent"]
 
 # Assertion predicate receives the agent's response for one turn. May be sync
 # or async. Returns True / False / raises (counts as 'errored').
-AssertionPredicate = Callable[["AgentResponse"], Union[bool, Awaitable[bool]]]
+AssertionPredicate = Callable[["AgentResponse"], bool | Awaitable[bool]]
 
 # Judge: receives the whole replay; returns a score + reason. Runs once per
 # replay against the dev's LLM credentials — xray never holds them.
@@ -52,7 +52,7 @@ class Turn:
     assertion_name: str | None = None
 
     @classmethod
-    def user(cls, text: str, *, key: str | None = None, audio: AudioRef | None = None) -> "Turn":
+    def user(cls, text: str, *, key: str | None = None, audio: AudioRef | None = None) -> Turn:
         return cls(role="user", text=text, key=key, audio=audio)
 
 
@@ -142,10 +142,16 @@ def _audio_to_wire(audio: AudioRef) -> dict[str, Any]:
 
 @dataclass
 class AgentResponse:
-    """What the runtime observed for one agent-side turn."""
+    """What the runtime observed for one agent-side turn.
+
+    No per-turn ``audio_path`` field: xray ships one WAV per replay (the
+    mixdown) and slices it in the inspector by the per-turn timestamps
+    on ``replay_turns``. The orchestrator uploads the mixdown to
+    ``POST /v1/replays/:id/audio``; the dev's assertion has no need for
+    a per-turn file path.
+    """
 
     transcript: str
-    audio_path: str | None = None
     duration_ms: int | None = None
 
 
@@ -157,8 +163,7 @@ class TurnRecord:
     role: Role
     key: str | None
     transcript: str | None
-    audio_path: str | None
-    assertion: "AssertionOutcome | None" = None
+    assertion: AssertionOutcome | None = None
 
 
 @dataclass

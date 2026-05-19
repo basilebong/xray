@@ -20,6 +20,13 @@ coverage/
 *.pem
 *.key
 
+# Python bytecode + caches (xray-py SDK)
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
 # Logs
 *.log
 pnpm-debug.log*

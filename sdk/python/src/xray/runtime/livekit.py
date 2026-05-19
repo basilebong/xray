@@ -1,52 +1,103 @@
 """LiveKit runtime — v1 implementation.
 
-Joins the dev's LiveKit room as a user-side participant. Sets
-``replay_id`` + ``conversation_id`` + ``conversation_version`` + ``modality``
-in the room metadata so the dev's agent can read them on connect and
-propagate them via OTEL baggage.
+Joins the dev's LiveKit room as the user-side participant. Publishes
+each user turn as a real audio track, captures the agent's audio +
+transcripts, and tees both into a single stereo WAV mixdown (left =
+user, right = agent) at ``~/.cache/xray-py/replays/<replay>.wav``.
 
-Heavy import (the ``livekit`` package) is lazy: importing this module
-without the ``[livekit]`` extra installed is fine until you actually
-construct a ``LiveKitRuntime``.
+User-side audio is sourced from ``turn.audio.path`` (recorded WAV) or
+synthesized via OpenAI TTS and cached at
+``~/.cache/xray-py/<conv>/<fingerprint>.wav`` so re-runs reuse bytes.
+
+The dev's OpenAI key stays in *their* process: the SDK calls OpenAI
+directly when synthesizing, never via xray.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
+import os
+import struct
+import time
+import wave
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, ClassVar
+
+import httpx
 
 from xray.conversation import AgentResponse, Conversation, Turn
+from xray.errors import (
+    AgentNotJoinedError,
+    AudioMissingError,
+    LiveKitDependencyError,
+    MixdownError,
+    RuntimeBindError,
+)
 from xray.runtime.base import Runtime, RuntimeResult
-from xray.trace import set_replay_context
+from xray.trace import aturn, set_replay_context
 
 logger = logging.getLogger(__name__)
+
+# LiveKit's default is 48 kHz mono. Matching the source rate avoids an
+# in-process resampler dep (audioop is deprecated on 3.13+).
+SAMPLE_RATE = 48000
+NUM_CHANNELS = 1
+SAMPLE_WIDTH_BYTES = 2  # int16
+FRAME_MS = 20
+SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_MS // 1000
+
+# OpenAI TTS returns raw int16 PCM at 24 kHz when response_format='pcm'.
+# We linearly upsample to 48 kHz so it matches the LiveKit AudioSource.
+_OPENAI_TTS_INPUT_RATE = 24000
+
+
+@dataclass
+class _TurnSegment:
+    """PCM captured for one turn, used to assemble the mixdown."""
+
+    role: str  # "user" | "agent"
+    idx: int
+    key: str | None
+    pcm: bytearray = field(default_factory=bytearray)
+    started_at: float | None = None
+    ended_at: float | None = None
+    transcript: str = ""
 
 
 @dataclass
 class LiveKitRuntime(Runtime):
     """Joins a LiveKit room and plays through the user side of a
-    Conversation. v1 plays per-turn pre-recorded audio (or TTS); v1.5
-    will stream a continuous user track."""
+    Conversation. v1 plays per-turn audio (recorded or OpenAI-TTS) and
+    captures one mixdown WAV per replay."""
 
     url: str
     api_key: str = field(repr=False)
     api_secret: str = field(repr=False)
     room: str
-    # Identity of the user-side participant we mint a token for.
     identity: str = "xray-driver"
-    # Wait this long for the agent participant to join before failing.
     agent_join_timeout_s: float = 30.0
+    agent_turn_timeout_s: float = 30.0
+    cache_root: Path = field(default_factory=lambda: Path.home() / ".cache" / "xray-py")
+    mixdown_dir: Path | None = None
+
+    # Injection points for tests. None ⇒ load the real packages.
+    _lk_rtc: Any = None
+    _lk_api: Any = None
+    _openai_tts: Any = None  # async (text, voice, model) -> bytes (pcm)
 
     # Populated by the orchestrator before ``run`` is called.
     replay_id: str | None = None
     conversation_id: str | None = None
     conversation_version: str | None = None
 
-    # Captured between turn-start and turn-end callbacks; the orchestrator
-    # reads these out via the returned RuntimeResult.
-    _captured: list[AgentResponse] = field(default_factory=list)
+    OPENAI_API_URL: ClassVar[str] = "https://api.openai.com/v1/audio/speech"
+    DEFAULT_OPENAI_TTS_MODEL: ClassVar[str] = "gpt-4o-mini-tts"
+    DEFAULT_OPENAI_TTS_VOICE: ClassVar[str] = "alloy"
 
     def bind(
         self,
@@ -66,37 +117,14 @@ class LiveKitRuntime(Runtime):
             or self.conversation_id is None
             or self.conversation_version is None
         ):
-            raise RuntimeError(
+            raise RuntimeBindError(
                 "LiveKitRuntime: bind(replay_id=..., conversation_id=..., "
                 "conversation_version=...) must be called before run()."
             )
 
-        # Local import — the livekit package is heavy and optional.
-        try:
-            from livekit import api as lk_api  # type: ignore[import-not-found]
-            from livekit import rtc as lk_rtc  # type: ignore[import-not-found]
-        except ImportError as e:  # pragma: no cover — dep guard
-            raise RuntimeError(
-                "LiveKitRuntime requires `pip install xray-py[livekit]`."
-            ) from e
+        lk_rtc, lk_api = self._load_livekit()
+        token = self._mint_token(lk_api)
 
-        # Mint the user-side token.
-        token = (
-            lk_api.AccessToken(self.api_key, self.api_secret)
-            .with_identity(self.identity)
-            .with_grants(lk_api.VideoGrants(room_join=True, room=self.room))
-            .to_jwt()
-        )
-
-        # Stamp the room metadata before joining so the agent has it on connect.
-        metadata = json.dumps(
-            {
-                "xray.replay.id": self.replay_id,
-                "xray.conversation.id": self.conversation_id,
-                "xray.conversation.version": self.conversation_version,
-                "xray.modality": "voice",
-            }
-        )
         set_replay_context(
             replay_id=self.replay_id,
             conversation_id=self.conversation_id,
@@ -105,58 +133,436 @@ class LiveKitRuntime(Runtime):
 
         room = lk_rtc.Room()
         agent_joined = asyncio.Event()
+        agent_track_event = asyncio.Event()
+        agent_audio_track_holder: list[Any] = []
+        transcription_queue: asyncio.Queue[Any] = asyncio.Queue()
 
         @room.on("participant_connected")
-        def _on_join(participant):  # type: ignore[no-untyped-def]
+        def _on_join(participant: Any) -> None:
             if participant.identity != self.identity:
                 agent_joined.set()
 
+        @room.on("track_subscribed")
+        def _on_track(track: Any, _publication: Any, participant: Any) -> None:
+            if participant.identity == self.identity:
+                return
+            # LiveKit's TrackKind is a protobuf enum — compare by integer
+            # value or fall back to a string match. Mocks can supply either.
+            kind = getattr(track, "kind", None)
+            kind_audio = getattr(lk_rtc.TrackKind, "KIND_AUDIO", None)
+            if kind == kind_audio or str(kind).lower().endswith("audio"):
+                agent_audio_track_holder.append(track)
+                agent_track_event.set()
+
+        @room.on("transcription_received")
+        def _on_transcription(segments: Any, participant: Any, _pub: Any) -> None:
+            if participant.identity == self.identity:
+                return
+            for seg in segments:
+                transcription_queue.put_nowait(seg)
+
         await room.connect(self.url, token, options=lk_rtc.RoomOptions())
         try:
+            await self._set_room_metadata(room)
             try:
-                await room.local_participant.set_metadata(metadata)
-            except Exception:  # pragma: no cover — server may forbid this
-                logger.warning("LiveKitRuntime: could not set room metadata; "
-                               "agent must read replay id from token claims instead")
-
-            try:
-                await asyncio.wait_for(agent_joined.wait(), timeout=self.agent_join_timeout_s)
+                await asyncio.wait_for(
+                    agent_joined.wait(), timeout=self.agent_join_timeout_s
+                )
             except asyncio.TimeoutError as e:
-                raise RuntimeError("agent_not_joined") from e
+                raise AgentNotJoinedError(self.room, self.agent_join_timeout_s) from e
 
-            return await self._play_turns(conversation)
+            audio_source = lk_rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
+            local_track = lk_rtc.LocalAudioTrack.create_audio_track(
+                "xray-user", audio_source
+            )
+            publish_opts = lk_rtc.TrackPublishOptions()
+            publish_opts.source = lk_rtc.TrackSource.SOURCE_MICROPHONE
+            await room.local_participant.publish_track(local_track, publish_opts)
+
+            segments, responses = await self._play_turns(
+                conversation=conversation,
+                audio_source=audio_source,
+                lk_rtc=lk_rtc,
+                agent_audio_track_holder=agent_audio_track_holder,
+                agent_track_event=agent_track_event,
+                transcription_queue=transcription_queue,
+            )
         finally:
             await room.disconnect()
 
-    async def _play_turns(self, conversation: Conversation) -> RuntimeResult:
-        """Replay turn audio one at a time. v1 implementation is best-effort:
-        the public ``Runtime`` contract is what the orchestrator depends on;
-        the per-step playback details will evolve with LiveKit's track API."""
+        mixdown_path = self._write_mixdown(segments)
+        return RuntimeResult(
+            responses=responses,
+            full_audio_path=str(mixdown_path) if mixdown_path is not None else None,
+            full_transcript=" ".join(r.transcript for r in responses if r.transcript).strip()
+            or None,
+        )
+
+    async def _set_room_metadata(self, room: Any) -> None:
+        metadata = json.dumps(
+            {
+                "xray.replay.id": self.replay_id,
+                "xray.conversation.id": self.conversation_id,
+                "xray.conversation.version": self.conversation_version,
+                "xray.modality": "voice",
+            }
+        )
+        # LiveKit grants may forbid participant-set metadata. We surface
+        # the warning but don't fail the run — the agent can fall back to
+        # reading the token's identity claims to find the replay id.
+        try:
+            await room.local_participant.set_metadata(metadata)
+        except Exception as e:
+            logger.warning(
+                "LiveKitRuntime: could not set participant metadata (%s); "
+                "agent must read replay id from token claims instead",
+                e,
+            )
+
+    async def _play_turns(
+        self,
+        *,
+        conversation: Conversation,
+        audio_source: Any,
+        lk_rtc: Any,
+        agent_audio_track_holder: list[Any],
+        agent_track_event: asyncio.Event,
+        transcription_queue: asyncio.Queue[Any],
+    ) -> tuple[list[_TurnSegment], list[AgentResponse]]:
+        segments: list[_TurnSegment] = []
         responses: list[AgentResponse] = []
-        for turn in conversation.turns:
-            if turn.role == "user":
-                await self._play_user_turn(turn)
-                responses.append(AgentResponse(transcript="", audio_path=None))
-            else:
-                response = await self._capture_agent_turn()
-                responses.append(response)
-        return RuntimeResult(responses=responses)
+        for idx, turn in enumerate(conversation.turns):
+            async with aturn(idx, key=turn.key):
+                if turn.role == "user":
+                    seg = await self._play_user_turn(
+                        conv_id=conversation.id,
+                        idx=idx,
+                        turn=turn,
+                        audio_source=audio_source,
+                        lk_rtc=lk_rtc,
+                    )
+                    segments.append(seg)
+                    responses.append(AgentResponse(transcript=""))
+                else:
+                    seg, response = await self._capture_agent_turn(
+                        idx=idx,
+                        turn=turn,
+                        lk_rtc=lk_rtc,
+                        agent_audio_track_holder=agent_audio_track_holder,
+                        agent_track_event=agent_track_event,
+                        transcription_queue=transcription_queue,
+                    )
+                    segments.append(seg)
+                    responses.append(response)
+        return segments, responses
 
-    async def _play_user_turn(self, turn: Turn) -> None:
-        # Real implementation publishes an audio track sourced from
-        # turn.audio.path (or TTSes turn.text once and caches it). For v1
-        # the orchestrator delegates that work to runtime subclasses; this
-        # placeholder keeps the contract honest.
-        await asyncio.sleep(0)
+    async def _play_user_turn(
+        self,
+        *,
+        conv_id: str,
+        idx: int,
+        turn: Turn,
+        audio_source: Any,
+        lk_rtc: Any,
+    ) -> _TurnSegment:
+        pcm = await self._load_or_synth_user_pcm(conv_id=conv_id, idx=idx, turn=turn)
+        segment = _TurnSegment(role="user", idx=idx, key=turn.key, transcript=turn.text or "")
+        segment.started_at = time.time()
+        await self._publish_pcm(
+            audio_source=audio_source, lk_rtc=lk_rtc, pcm=pcm, segment=segment
+        )
+        segment.ended_at = time.time()
+        return segment
 
-    async def _capture_agent_turn(self) -> AgentResponse:
-        # Real implementation subscribes to the agent's audio track + (if
-        # available) a transcript event channel. Placeholder yields nothing
-        # so the runtime stays usable in unit tests with a stubbed LiveKit.
-        await asyncio.sleep(0)
-        return AgentResponse(transcript="", audio_path=None)
+    async def _publish_pcm(
+        self,
+        *,
+        audio_source: Any,
+        lk_rtc: Any,
+        pcm: bytes,
+        segment: _TurnSegment,
+    ) -> None:
+        """Push 20 ms int16 frames into the AudioSource. The trailing
+        partial frame is zero-padded so AudioFrame's samples_per_channel
+        always matches the buffer length LiveKit expects."""
+        bytes_per_frame = SAMPLES_PER_FRAME * SAMPLE_WIDTH_BYTES * NUM_CHANNELS
+        for start in range(0, len(pcm), bytes_per_frame):
+            chunk = pcm[start : start + bytes_per_frame]
+            if len(chunk) < bytes_per_frame:
+                chunk = chunk + b"\x00" * (bytes_per_frame - len(chunk))
+            frame = lk_rtc.AudioFrame(
+                data=chunk,
+                sample_rate=SAMPLE_RATE,
+                num_channels=NUM_CHANNELS,
+                samples_per_channel=SAMPLES_PER_FRAME,
+            )
+            await audio_source.capture_frame(frame)
+            segment.pcm.extend(chunk)
+
+    async def _capture_agent_turn(
+        self,
+        *,
+        idx: int,
+        turn: Turn,
+        lk_rtc: Any,
+        agent_audio_track_holder: list[Any],
+        agent_track_event: asyncio.Event,
+        transcription_queue: asyncio.Queue[Any],
+    ) -> tuple[_TurnSegment, AgentResponse]:
+        # Wait for the agent's track if it hasn't arrived yet.
+        try:
+            await asyncio.wait_for(
+                agent_track_event.wait(), timeout=self.agent_turn_timeout_s
+            )
+        except asyncio.TimeoutError as e:
+            raise AgentNotJoinedError(self.room, self.agent_turn_timeout_s) from e
+        track = agent_audio_track_holder[-1]
+        stream = lk_rtc.AudioStream(
+            track, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS
+        )
+
+        segment = _TurnSegment(role="agent", idx=idx, key=turn.key)
+        segment.started_at = time.time()
+        transcript_buf: list[str] = []
+        final_seen = asyncio.Event()
+
+        async def _drain_transcripts() -> None:
+            while not final_seen.is_set():
+                seg = await transcription_queue.get()
+                transcript_buf.append(seg.text)
+                if getattr(seg, "final", False):
+                    final_seen.set()
+                    return
+
+        transcript_task = asyncio.create_task(_drain_transcripts())
+        deadline = time.time() + self.agent_turn_timeout_s
+
+        try:
+            async for event in stream:
+                segment.pcm.extend(bytes(event.frame.data))
+                if final_seen.is_set() or time.time() > deadline:
+                    break
+        finally:
+            await stream.aclose()
+            # Drain anything in the queue before tearing down the task —
+            # segments may have arrived before the task got a turn on the
+            # loop (common when the stream finishes synchronously, as in
+            # the test mocks).
+            while not transcription_queue.empty():
+                seg = transcription_queue.get_nowait()
+                transcript_buf.append(seg.text)
+                if getattr(seg, "final", False):
+                    final_seen.set()
+            if not transcript_task.done():
+                transcript_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await transcript_task
+
+        segment.ended_at = time.time()
+        segment.transcript = " ".join(transcript_buf).strip()
+        return segment, AgentResponse(
+            transcript=segment.transcript,
+            duration_ms=int((segment.ended_at - segment.started_at) * 1000),
+        )
+
+    def _write_mixdown(self, segments: list[_TurnSegment]) -> Path | None:
+        if not segments:
+            return None
+        mixdown_root = self.mixdown_dir or (self.cache_root / "replays")
+        mixdown_root.mkdir(parents=True, exist_ok=True)
+        out_path = mixdown_root / f"{self.replay_id}.wav"
+        try:
+            write_stereo_mixdown(segments=segments, out_path=out_path)
+        except OSError as e:
+            raise MixdownError(f"could not write mixdown WAV: {e}") from e
+        return out_path
+
+    async def _load_or_synth_user_pcm(
+        self, *, conv_id: str, idx: int, turn: Turn
+    ) -> bytes:
+        if turn.audio is not None and turn.audio.kind == "recorded":
+            if turn.audio.path is None:
+                raise AudioMissingError(
+                    f"turn {idx}: audio.kind='recorded' but no path provided",
+                    turn_idx=idx,
+                )
+            return _read_wav_as_pcm48k_mono(Path(turn.audio.path), turn_idx=idx)
+
+        # TTS branch: either explicit kind='tts' or no audio + text fallback.
+        if turn.text is None:
+            raise AudioMissingError(
+                f"turn {idx}: no audio and no text to synthesize",
+                turn_idx=idx,
+            )
+        api_key = os.environ.get("OPENAI_API_KEY")
+        # Tests inject ``_openai_tts`` directly so the OpenAI key check
+        # is skipped — otherwise CI would need OPENAI_API_KEY just to run
+        # unit tests that never hit the network.
+        if not api_key and self._openai_tts is None:
+            raise AudioMissingError(
+                f"turn {idx}: TTS requested but OPENAI_API_KEY is not set",
+                turn_idx=idx,
+            )
+        voice = (turn.audio.voice_id if turn.audio is not None else None) or os.environ.get(
+            "OPENAI_TTS_VOICE", self.DEFAULT_OPENAI_TTS_VOICE
+        )
+        model = os.environ.get("OPENAI_TTS_MODEL", self.DEFAULT_OPENAI_TTS_MODEL)
+        return await self._tts_to_cached_pcm(
+            conv_id=conv_id, text=turn.text, voice=voice, model=model, api_key=api_key or ""
+        )
+
+    async def _tts_to_cached_pcm(
+        self, *, conv_id: str, text: str, voice: str, model: str, api_key: str
+    ) -> bytes:
+        cache_dir = self.cache_root / conv_id
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"text": text, "voice": voice, "model": model},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        cached = cache_dir / f"{fingerprint}.wav"
+        if cached.exists():
+            return _read_wav_as_pcm48k_mono(cached, turn_idx=None)
+
+        if self._openai_tts is not None:
+            pcm_24k = await self._openai_tts(text=text, voice=voice, model=model)
+        else:
+            pcm_24k = await _openai_tts_pcm(
+                text=text, voice=voice, model=model, api_key=api_key
+            )
+        pcm_48k = _upsample_2x_int16(pcm_24k)
+        _write_pcm_as_wav(pcm_48k, cached, sample_rate=SAMPLE_RATE)
+        return pcm_48k
+
+    def _mint_token(self, lk_api: Any) -> str:
+        return (
+            lk_api.AccessToken(self.api_key, self.api_secret)
+            .with_identity(self.identity)
+            .with_grants(lk_api.VideoGrants(room_join=True, room=self.room))
+            .to_jwt()
+        )
+
+    def _load_livekit(self) -> tuple[Any, Any]:
+        if self._lk_rtc is not None and self._lk_api is not None:
+            return self._lk_rtc, self._lk_api
+        try:
+            from livekit import api as lk_api_mod
+            from livekit import rtc as lk_rtc_mod
+        except ImportError as e:
+            raise LiveKitDependencyError(
+                "LiveKitRuntime requires `pip install xray-py[livekit]`."
+            ) from e
+        return lk_rtc_mod, lk_api_mod
 
     async def aclose(self) -> None:
-        # Nothing persistent to release in v1; subclasses with sockets
-        # should override.
+        # Nothing persistent to release in v1.
         return None
+
+
+def _read_wav_as_pcm48k_mono(path: Path, *, turn_idx: int | None) -> bytes:
+    """Read a WAV file and return its PCM bytes. Requires 48 kHz / mono /
+    16-bit signed so we don't need a runtime resampler."""
+    if not path.exists():
+        raise AudioMissingError(f"recorded audio not found: {path}", turn_idx=turn_idx)
+    try:
+        with wave.open(str(path), "rb") as w:
+            sample_rate = w.getframerate()
+            channels = w.getnchannels()
+            sample_width = w.getsampwidth()
+            frame_count = w.getnframes()
+            pcm = w.readframes(frame_count)
+    except wave.Error as e:
+        raise AudioMissingError(f"invalid WAV file at {path}: {e}", turn_idx=turn_idx) from e
+    if sample_rate != SAMPLE_RATE or channels != NUM_CHANNELS or sample_width != 2:
+        raise AudioMissingError(
+            f"recorded audio at {path} must be 48000 Hz, 1 channel, 16-bit (got "
+            f"{sample_rate} Hz, {channels} ch, {sample_width * 8}-bit). Re-encode with "
+            "`ffmpeg -i in.wav -ar 48000 -ac 1 -sample_fmt s16 out.wav`.",
+            turn_idx=turn_idx,
+        )
+    return pcm
+
+
+def _write_pcm_as_wav(pcm: bytes, path: Path, *, sample_rate: int) -> None:
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(NUM_CHANNELS)
+        w.setsampwidth(SAMPLE_WIDTH_BYTES)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+
+
+def _upsample_2x_int16(pcm: bytes) -> bytes:
+    """Cheap 2x linear-interpolation upsampler. Sufficient for voice
+    intelligibility — we avoid pulling in scipy/audioop just for this."""
+    samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+    out: list[int] = []
+    for i, s in enumerate(samples):
+        out.append(s)
+        nxt = samples[i + 1] if i + 1 < len(samples) else s
+        out.append((s + nxt) // 2)
+    return struct.pack(f"<{len(out)}h", *out)
+
+
+async def _openai_tts_pcm(
+    *,
+    text: str,
+    voice: str,
+    model: str,
+    api_key: str,
+) -> bytes:
+    """Call OpenAI's /v1/audio/speech with response_format='pcm'. Returns
+    raw int16 PCM at 24 kHz."""
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            LiveKitRuntime.OPENAI_API_URL,
+            json={
+                "model": model,
+                "voice": voice,
+                "input": text,
+                "response_format": "pcm",
+            },
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        if response.status_code >= 400:
+            raise AudioMissingError(
+                f"OpenAI TTS returned HTTP {response.status_code}: "
+                f"{response.text[:200]}"
+            )
+        return response.content
+
+
+def write_stereo_mixdown(*, segments: list[_TurnSegment], out_path: Path) -> None:
+    """Write segments as a stereo WAV: left = user, right = agent. Silence
+    fills whichever channel isn't speaking in a given segment. Public so
+    the test suite can exercise it without spinning up the full runtime."""
+    with wave.open(str(out_path), "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(SAMPLE_WIDTH_BYTES)
+        w.setframerate(SAMPLE_RATE)
+        for seg in segments:
+            if not seg.pcm:
+                continue
+            num_samples = len(seg.pcm) // SAMPLE_WIDTH_BYTES
+            silence = b"\x00\x00" * num_samples
+            left = bytes(seg.pcm) if seg.role == "user" else silence
+            right = bytes(seg.pcm) if seg.role == "agent" else silence
+            w.writeframes(_interleave_lr(left=left, right=right))
+
+
+def _interleave_lr(*, left: bytes, right: bytes) -> bytes:
+    """Interleave two equal-length mono int16 streams into stereo int16."""
+    if len(left) != len(right):
+        raise MixdownError(
+            f"channel length mismatch during mixdown: left={len(left)}, right={len(right)}"
+        )
+    out = bytearray(len(left) * 2)
+    for i in range(0, len(left), 2):
+        out[i * 2 : i * 2 + 2] = left[i : i + 2]
+        out[i * 2 + 2 : i * 2 + 4] = right[i : i + 2]
+    return bytes(out)

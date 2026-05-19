@@ -5,7 +5,14 @@ Run with::
     export LIVEKIT_URL=wss://your-project.livekit.cloud
     export LIVEKIT_API_KEY=...
     export LIVEKIT_API_SECRET=...
+    export OPENAI_API_KEY=...   # needed for kind="tts" user turns
     python examples/booking_happy_path.py
+
+The Conversation below uses TTS for the user turn — the SDK calls
+OpenAI directly using OPENAI_API_KEY and caches the synth in
+``~/.cache/xray-py/<conv_id>/<fingerprint>.wav`` so re-runs are
+deterministic. Swap to ``AudioRef(kind="recorded", path="...wav")``
+if you'd rather ship pre-recorded audio.
 """
 
 from __future__ import annotations
@@ -13,7 +20,7 @@ from __future__ import annotations
 import os
 
 from xray import Conversation, Turn, expect_agent_turn, run
-from xray.conversation import AgentResponse
+from xray.conversation import AgentResponse, AudioRef
 from xray.runtime.livekit import LiveKitRuntime
 
 
@@ -26,7 +33,11 @@ def main() -> None:
         id="booking-happy-path",
         title="Books a table for two",
         turns=[
-            Turn.user("Hi, I'd like to book a table for two at 7pm.", key="u0"),
+            Turn.user(
+                "Hi, I'd like to book a table for two at 7pm.",
+                key="u0",
+                audio=AudioRef(kind="tts"),
+            ),
             expect_agent_turn(
                 key="a0",
                 assertion=confirms_booking,
