@@ -1,4 +1,4 @@
-"""Unit tests for ``LiveKitRuntime`` with the LiveKit room I/O stubbed.
+"""Unit tests for ``LiveKitDriver`` with the LiveKit room I/O stubbed.
 
 We never hit the network: ``lk_rtc`` / ``lk_api`` are stub modules
 injected via the runtime's ``_lk_rtc`` / ``_lk_api`` fields. The fake
@@ -18,14 +18,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from xray import Conversation, Turn, expect_agent_turn
+from xray import Conversation, Turn
 from xray.conversation import RecordedAudio, TtsAudio
 from xray.errors import AgentNotJoinedError, RuntimeBindError
 from xray.runtime.livekit import (
     NUM_CHANNELS,
     SAMPLE_RATE,
     SAMPLE_WIDTH_BYTES,
-    LiveKitRuntime,
+    LiveKitDriver,
     _TurnSegment,
     _upsample_2x_int16,
     write_stereo_mixdown,
@@ -195,8 +195,8 @@ def _runtime(
     lk_rtc: Any,
     lk_api: Any,
     openai_tts: Any | None = None,
-) -> LiveKitRuntime:
-    rt = LiveKitRuntime(
+) -> LiveKitDriver:
+    rt = LiveKitDriver(
         url="wss://fake",
         api_key="ak",
         api_secret="sk",
@@ -215,7 +215,7 @@ def _runtime(
 
 
 def test_bind_required_before_run():
-    rt = LiveKitRuntime(url="x", api_key="k", api_secret="s", room="r")
+    rt = LiveKitDriver(url="x", api_key="k", api_secret="s", room="r")
     conv = Conversation(id="c", turns=[Turn.user("hi")])
     with pytest.raises(RuntimeBindError) as exc:
         asyncio.run(rt.run(conv))
@@ -284,7 +284,7 @@ def test_runtime_captures_agent_turn_via_transcription(tmp_path: Path):
         id="c",
         turns=[
             Turn.user("hello", key="u0", audio=RecordedAudio(path=str(wav_path))),
-            expect_agent_turn(key="a0"),
+            Turn.agent(key="a0"),
         ],
     )
 
