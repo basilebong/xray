@@ -69,8 +69,7 @@ class RuntimeBindable(Protocol):
         self,
         *,
         replay_id: str,
-        conversation_id: str,
-        conversation_version: str,
+        conversation_hash: str,
     ) -> None: ...
 
 

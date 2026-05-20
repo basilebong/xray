@@ -147,8 +147,7 @@ class LiveKitDriver(Runtime):
 
     # Populated by the orchestrator before ``run`` is called.
     replay_id: str | None = None
-    conversation_id: str | None = None
-    conversation_version: str | None = None
+    conversation_hash: str | None = None
 
     OPENAI_API_URL: ClassVar[str] = "https://api.openai.com/v1/audio/speech"
     DEFAULT_OPENAI_TTS_MODEL: ClassVar[str] = "gpt-4o-mini-tts"
@@ -158,24 +157,18 @@ class LiveKitDriver(Runtime):
         self,
         *,
         replay_id: str,
-        conversation_id: str,
-        conversation_version: str,
+        conversation_hash: str,
     ) -> None:
         """Called by the orchestrator once it knows the Replay's id."""
         self.replay_id = replay_id
-        self.conversation_id = conversation_id
-        self.conversation_version = conversation_version
+        self.conversation_hash = conversation_hash
 
     @override
     async def run(self, conversation: Conversation) -> RuntimeResult:
-        if (
-            self.replay_id is None
-            or self.conversation_id is None
-            or self.conversation_version is None
-        ):
+        if self.replay_id is None or self.conversation_hash is None:
             raise RuntimeBindError(
-                "LiveKitDriver: bind(replay_id=..., conversation_id=..., "
-                "conversation_version=...) must be called before run()."
+                "LiveKitDriver: bind(replay_id=..., conversation_hash=...) "
+                "must be called before run()."
             )
 
         lk_rtc, lk_api = self._load_livekit()
@@ -265,12 +258,13 @@ class LiveKitDriver(Runtime):
     ) -> tuple[list[_TurnSegment], list[AgentResponse]]:
         segments: list[_TurnSegment] = []
         responses: list[AgentResponse] = []
+        conv_hash = self.conversation_hash or "unbound"
         for idx, turn in enumerate(conversation.turns):
             async with _scoped_turn(idx, key=turn.key):
                 match turn.role:
                     case "user":
                         user_seg = await self._play_user_turn(
-                            conv_id=conversation.id,
+                            conv_hash=conv_hash,
                             idx=idx,
                             turn=turn,
                             audio_source=audio_source,
@@ -296,13 +290,13 @@ class LiveKitDriver(Runtime):
     async def _play_user_turn(
         self,
         *,
-        conv_id: str,
+        conv_hash: str,
         idx: int,
         turn: Turn,
         audio_source: LkAudioSource,
         lk_rtc: LkRtcModule,
     ) -> _TurnSegment:
-        pcm = await self._load_or_synth_user_pcm(conv_id=conv_id, idx=idx, turn=turn)
+        pcm = await self._load_or_synth_user_pcm(conv_hash=conv_hash, idx=idx, turn=turn)
         transcript = turn.text or ""
         segment = _TurnSegment(role="user", idx=idx, key=turn.key, transcript=transcript)
         # Emit an ``xray.turn`` span scoped to the audio publish so the
@@ -448,23 +442,23 @@ class LiveKitDriver(Runtime):
             raise MixdownError(f"could not write mixdown WAV: {e}") from e
         return out_path
 
-    async def _load_or_synth_user_pcm(self, *, conv_id: str, idx: int, turn: Turn) -> bytes:
+    async def _load_or_synth_user_pcm(self, *, conv_hash: str, idx: int, turn: Turn) -> bytes:
         match turn.audio:
             case RecordedAudio(path=path):
                 return _read_wav_as_pcm48k_mono(Path(path), turn_idx=idx)
             case TtsAudio(voice_id=voice_id):
                 return await self._synth_tts_pcm(
-                    conv_id=conv_id, idx=idx, turn=turn, voice_id=voice_id
+                    conv_hash=conv_hash, idx=idx, turn=turn, voice_id=voice_id
                 )
             case None:
                 # No explicit audio → fall back to TTS. The missing-text
                 # case is raised inside _synth_tts_pcm.
-                return await self._synth_tts_pcm(conv_id=conv_id, idx=idx, turn=turn, voice_id=None)
+                return await self._synth_tts_pcm(conv_hash=conv_hash, idx=idx, turn=turn, voice_id=None)
             case _:
                 assert_never(turn.audio)
 
     async def _synth_tts_pcm(
-        self, *, conv_id: str, idx: int, turn: Turn, voice_id: str | None
+        self, *, conv_hash: str, idx: int, turn: Turn, voice_id: str | None
     ) -> bytes:
         if turn.text is None:
             raise AudioMissingError(
@@ -483,13 +477,13 @@ class LiveKitDriver(Runtime):
         voice = voice_id or os.environ.get("OPENAI_TTS_VOICE", self.DEFAULT_OPENAI_TTS_VOICE)
         model = os.environ.get("OPENAI_TTS_MODEL", self.DEFAULT_OPENAI_TTS_MODEL)
         return await self._tts_to_cached_pcm(
-            conv_id=conv_id, text=turn.text, voice=voice, model=model, api_key=api_key or ""
+            conv_hash=conv_hash, text=turn.text, voice=voice, model=model, api_key=api_key or ""
         )
 
     async def _tts_to_cached_pcm(
-        self, *, conv_id: str, text: str, voice: str, model: str, api_key: str
+        self, *, conv_hash: str, text: str, voice: str, model: str, api_key: str
     ) -> bytes:
-        cache_dir = self.cache_root / conv_id
+        cache_dir = self.cache_root / conv_hash
         cache_dir.mkdir(parents=True, exist_ok=True)
         fingerprint = hashlib.sha256(
             json.dumps(
@@ -516,19 +510,14 @@ class LiveKitDriver(Runtime):
         :func:`xray.instrument` decorator parses it from
         ``participant.attributes`` on join. No participant-metadata
         set, no ``can_update_own_metadata`` grant needed."""
-        if (
-            self.replay_id is None
-            or self.conversation_id is None
-            or self.conversation_version is None
-        ):
+        if self.replay_id is None or self.conversation_hash is None:
             raise RuntimeBindError(
-                "LiveKitDriver: bind(replay_id=..., conversation_id=..., "
-                "conversation_version=...) must be called before token minting."
+                "LiveKitDriver: bind(replay_id=..., conversation_hash=...) "
+                "must be called before token minting."
             )
         attributes = encode_attribute(
             replay_id=self.replay_id,
-            conversation_id=self.conversation_id,
-            conversation_version=self.conversation_version,
+            conversation_hash=self.conversation_hash,
         )
         builder = lk_api.AccessToken(self.api_key, self.api_secret)
         builder = builder.with_identity(self.identity)

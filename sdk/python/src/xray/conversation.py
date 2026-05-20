@@ -1,10 +1,10 @@
 """Test-definition primitives.
 
 A ``Conversation`` is the dev-authored spec: an ordered list of ``Turn``\\ s,
-plus per-turn assertion predicates and a per-replay LLM judge. The SDK
-auto-computes the ``version`` fingerprint over the turn structure so the
-``(id, version)`` upsert against ``POST /v1/conversations`` is rejected when
-the dev edits the spec without bumping ``id``.
+plus per-turn assertion predicates. The SDK computes a content hash over
+the turns (including sha256 of per-turn ``RecordedAudio`` bytes) that
+identifies the conversation server-side — there is no dev-set id. The
+``name`` field is a free-form display label only.
 
 Type safety: ``AudioRef`` is a discriminated union (``RecordedAudio`` vs
 ``TtsAudio``), and wire payloads are ``TypedDict``\\ s. See
@@ -13,13 +13,18 @@ Type safety: ``AudioRef`` is a discriminated union (``RecordedAudio`` vs
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, TypeAlias, TypedDict
 
 from typing_extensions import NotRequired, assert_never
+
+from ._json import JsonObject
 
 Role: TypeAlias = Literal["user", "agent"]
 AssertionStatus: TypeAlias = Literal["passed", "failed", "errored"]
@@ -47,7 +52,7 @@ class RecordedAudio:
 @dataclass(frozen=True)
 class TtsAudio:
     """Synthesize from ``Turn.text`` via OpenAI TTS. Cached per
-    conversation at ``~/.cache/xray-py/<conv>/<fingerprint>.wav``."""
+    conversation at ``~/.cache/xray-py/<hash>/<voice_id>.wav``."""
 
     voice_id: str | None = None
     kind: Literal["tts"] = field(default="tts", init=False)
@@ -102,53 +107,74 @@ class Turn:
 
 @dataclass
 class Conversation:
-    """The dev-authored test definition."""
+    """The dev-authored test definition.
 
-    id: str
+    Identity is the SHA-256 content hash over the turn array (including
+    sha256 of per-turn ``RecordedAudio`` bytes). ``name`` is a free-form
+    display label only — renaming does NOT change the hash.
+    """
+
+    name: str
     turns: list[Turn]
-    title: str | None = None
     judge: JudgePredicate | None = None
-    # Overridable so the dev can pin a version even when the structure changes
-    # — but the default is the fingerprint, which is what the docs recommend.
-    version: str = ""
 
     def __post_init__(self) -> None:
-        if not self.version:
-            self.version = self.compute_version()
+        if not self.name:
+            raise ValueError("Conversation.name must be non-empty")
         if len(self.turns) == 0:
             raise ValueError("Conversation must have at least one turn")
 
-    def compute_version(self) -> str:
-        """Stable fingerprint over the turn structure. Matches the
-        server-side canonical encoding (JSON-stringified turn array)."""
+    @functools.cached_property
+    def hash(self) -> str:
+        """Content hash. First access reads any ``RecordedAudio`` WAVs from
+        disk to sha256 the bytes; subsequent accesses return the cached value.
+
+        Canonical JSON over the turn array, with ``RecordedAudio`` referenced
+        by sha256 of file bytes. Mirrors the server-side canonicalization —
+        see ``tests/fixtures/hash-parity.json``.
+        """
         canonical = json.dumps(
-            [_turn_to_fingerprint(t) for t in self.turns],
+            [_turn_to_wire(t) for t in self.turns],
             separators=(",", ":"),
             sort_keys=True,
+            ensure_ascii=True,
         )
-        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
-        return f"v{digest}"
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def to_spec_payload(self) -> ConversationSpecBody:
-        """POST body for ``/v1/conversations`` — matches the server
-        Valibot schema."""
-        body: ConversationSpecBody = {
-            "id": self.id,
-            "version": self.version,
+    def to_replay_create_payload(
+        self,
+        *,
+        modality: Literal["voice"] = "voice",
+        run_config: JsonObject | None = None,
+    ) -> ReplayCreateBody:
+        """POST body for ``/v1/replays``. The server recomputes the hash
+        from ``turns`` — we do NOT send the SDK-computed hash on the wire
+        (trust boundary)."""
+        body: ReplayCreateBody = {
+            "name": self.name,
             "turns": [_turn_to_wire(t) for t in self.turns],
+            "modality": modality,
         }
-        if self.title is not None:
-            body["title"] = self.title
+        if run_config is not None:
+            body["run_config"] = run_config
         return body
 
 
 # ─── Wire payloads (TypedDicts) ───────────────────────────────────────
 
 
-class AudioWirePayload(TypedDict):
-    kind: Literal["recorded", "tts"]
-    path: NotRequired[str]
+class RecordedAudioWirePayload(TypedDict):
+    kind: Literal["recorded"]
+    path: str
+    sha256: str
+
+
+class TtsAudioWirePayload(TypedDict):
+    kind: Literal["tts"]
     voice_id: NotRequired[str]
+
+
+AudioWirePayload: TypeAlias = RecordedAudioWirePayload | TtsAudioWirePayload
 
 
 class TurnWirePayload(TypedDict):
@@ -158,24 +184,11 @@ class TurnWirePayload(TypedDict):
     audio: NotRequired[AudioWirePayload]
 
 
-class TurnFingerprintPayload(TypedDict):
-    """Like ``TurnWirePayload`` but with a presence marker for callable
-    assertions so two functions with identical signatures fingerprint
-    the same. Distinct TypedDict (not a subclass) so the optional marker
-    is statically expressible without widening ``TurnWirePayload``."""
-
-    role: Role
-    text: NotRequired[str]
-    key: NotRequired[str]
-    audio: NotRequired[AudioWirePayload]
-    _has_assertion: NotRequired[bool]
-
-
-class ConversationSpecBody(TypedDict):
-    id: str
-    version: str
+class ReplayCreateBody(TypedDict):
+    name: str
     turns: list[TurnWirePayload]
-    title: NotRequired[str]
+    modality: Literal["voice"]
+    run_config: NotRequired[JsonObject]
 
 
 # ─── Wire encoders ────────────────────────────────────────────────────
@@ -184,11 +197,8 @@ class ConversationSpecBody(TypedDict):
 def _audio_to_wire(audio: AudioRef) -> AudioWirePayload:
     match audio:
         case RecordedAudio(path=path):
-            return {"kind": "recorded", "path": path}
+            return {"kind": "recorded", "path": path, "sha256": _sha256_file(path)}
         case TtsAudio(voice_id=voice_id):
-            # Narrow inside the arm — pyright doesn't propagate the
-            # voice_id field type through the match pattern, so
-            # destructure-then-guard is what keeps NotRequired[str] honest.
             if voice_id is None:
                 return {"kind": "tts"}
             return {"kind": "tts", "voice_id": voice_id}
@@ -207,17 +217,36 @@ def _turn_to_wire(turn: Turn) -> TurnWirePayload:
     return out
 
 
-def _turn_to_fingerprint(turn: Turn) -> TurnFingerprintPayload:
-    out: TurnFingerprintPayload = {"role": turn.role}
-    if turn.text is not None:
-        out["text"] = turn.text
-    if turn.key is not None:
-        out["key"] = turn.key
-    if turn.audio is not None:
-        out["audio"] = _audio_to_wire(turn.audio)
-    if turn.assertion is not None:
-        out["_has_assertion"] = True
-    return out
+# ─── Audio bytes sha256 (cached per file) ─────────────────────────────
+
+
+_AUDIO_SHA256_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def _sha256_file(path: str) -> str:
+    """SHA-256 hex of file bytes, cached by (path, mtime_ns, size).
+
+    The cache key includes mtime + size so editing the file (in place or
+    via rewrite) invalidates the entry on the next access. Raises if the
+    file doesn't exist — author-time error, surfaced where the hash is
+    first computed.
+    """
+    p = Path(path)
+    st = os.stat(p)
+    key = (str(p), st.st_mtime_ns, st.st_size)
+    cached = _AUDIO_SHA256_CACHE.get(key)
+    if cached is not None:
+        return cached
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+    digest = h.hexdigest()
+    _AUDIO_SHA256_CACHE[key] = digest
+    return digest
 
 
 # ─── Runtime-produced records ─────────────────────────────────────────
@@ -253,18 +282,7 @@ StageTimings: TypeAlias = dict[str, float]
 
 @dataclass(frozen=True)
 class AgentResponse:
-    """What the runtime + server observed for one agent-side turn.
-
-    ``transcript`` comes from the runtime (LiveKit transcription
-    publication). ``tool_calls`` / ``model_usage`` / ``stage_timings``
-    come from xray's persisted view of the spans the agent emitted
-    during this turn — the orchestrator fetches ``GET /v1/replays/:id``
-    after the runtime returns and projects per-turn slices into each
-    response.
-
-    No per-turn ``audio_path``: xray ships one WAV per replay (the
-    mixdown) and slices it in the inspector by per-turn timestamps.
-    """
+    """What the runtime + server observed for one agent-side turn."""
 
     transcript: str
     duration_ms: int | None = None
@@ -303,8 +321,8 @@ class JudgeOutcome:
 class ReplayResult:
     """Snapshot of one replay's outcome handed to a judge."""
 
-    conversation_id: str
-    conversation_version: str
+    conversation_hash: str
+    name: str
     turns: list[TurnRecord]
     transcript: str | None = None
 
@@ -317,17 +335,19 @@ __all__ = [
     "AudioRef",
     "AudioWirePayload",
     "Conversation",
-    "ConversationSpecBody",
     "JudgeOutcome",
     "JudgePredicate",
     "ModelUsage",
     "RecordedAudio",
+    "RecordedAudioWirePayload",
+    "ReplayCreateBody",
     "ReplayResult",
     "Role",
     "StageTimings",
     "ToolCall",
+    "TtsAudio",
+    "TtsAudioWirePayload",
     "Turn",
     "TurnRecord",
     "TurnWirePayload",
-    "TtsAudio",
 ]

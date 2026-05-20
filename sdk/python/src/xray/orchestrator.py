@@ -1,22 +1,23 @@
 """``xray.run(...)`` — convenience orchestrator.
 
-1. POST the Conversation (idempotent upsert).
-2. POST the Replay, get back ``replay_id``.
-3. Bind the runtime + run it.
-4. Upload the runtime's mixdown WAV (if produced).
-5. Fetch the rich per-turn server view (tool calls, model usage, stage
+1. POST the Replay (carries the full Conversation spec). Server computes
+   the conversation hash, upserts the conversation row if new, creates
+   the replay, returns ``replay_id``.
+2. Bind the runtime + run it.
+3. Upload the runtime's mixdown WAV (if produced).
+4. Fetch the rich per-turn server view (tool calls, model usage, stage
    timings) and merge it into each ``AgentResponse``.
-6. Evaluate per-turn assertions, then the per-replay judge (if any).
-7. PATCH the Replay row with final status + judge.
+5. Evaluate per-turn assertions.
+6. PATCH the Replay row with final status.
 
 Type safety: every outbound JSON body is a ``TypedDict``; the
-sync/async assertion + judge predicates are typed via the aliases in
+sync/async assertion predicates are typed via the aliases in
 ``xray.conversation``; runtime hooks are dispatched via the
 ``RuntimeBindable`` Protocol.
 
-Snake_case wire — bodies sent to xray use ``conversation_id`` /
-``conversation_version`` / ``run_config`` / ``failure_reason`` etc.
-Matches the server's Valibot schemas in `src/server/**/*.types.ts`.
+Snake_case wire — bodies sent to xray use ``conversation_hash`` /
+``run_config`` / ``failure_reason`` etc. Matches the server's Valibot
+schemas in `src/server/**/*.types.ts`.
 """
 
 from __future__ import annotations
@@ -24,7 +25,11 @@ from __future__ import annotations
 import contextvars
 import datetime as _dt
 import inspect
+import io
+import json
 import logging
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, TypeAlias, TypedDict
@@ -36,14 +41,13 @@ from opentelemetry.sdk.trace import TracerProvider
 from pydantic import BaseModel, Field, ValidationError
 from typing_extensions import NotRequired
 
-from xray._json import JsonValue
+from xray._json import JsonObject
 from xray.config import RunConfig
 from xray.conversation import (
     AgentResponse,
     AssertionOutcome,
     AssertionPredicate,
     Conversation,
-    JudgeOutcome,
     JudgePredicate,
     ModelUsage,
     RecordedAudio,
@@ -56,8 +60,8 @@ from xray.errors import (
     AudioMissingError,
     AudioTooLargeError,
     FailureReason,
-    VersionFingerprintMismatchError,
     XrayError,
+    XrayServerError,
 )
 from xray.otel import attach_replay_baggage
 from xray.otel import install as install_otel
@@ -80,9 +84,18 @@ ReplayLifecycleState: TypeAlias = Literal[
 
 
 class ReplayCreateBody(TypedDict):
-    conversation_id: str
-    conversation_version: str
-    run_config: NotRequired[dict[str, JsonValue]]
+    """Body of ``POST /v1/replays`` — references a pre-uploaded conversation
+    by content hash. The SDK POSTs ``/v1/conversations`` first (multipart
+    with optional audio bytes) and reuses the returned hash here."""
+
+    conversation_hash: str
+    run_config: NotRequired[JsonObject]
+
+
+class _ConversationUpsertResponse(BaseModel):
+    """Inbound shape for ``POST /v1/conversations``."""
+
+    hash: str
 
 
 class _ReplayCreateResponse(BaseModel):
@@ -110,11 +123,10 @@ class RunResult:
     """What ``run(...)`` returns. ``id`` matches the Replay row in xray."""
 
     id: str
-    conversation_id: str
-    conversation_version: str
+    conversation_hash: str
+    name: str
     status: ReplayStatus
     assertions: list[AssertionOutcome]
-    judge: JudgeOutcome | None
     url: str | None = None
 
 
@@ -135,37 +147,60 @@ async def run(
     """
     xray_url = xray_url.rstrip("/")
     async with httpx.AsyncClient(base_url=xray_url, timeout=30.0) as client:
-        # 1. Upsert Conversation.
-        spec = conversation.to_spec_payload()
-        r = await client.post("/v1/conversations", json=spec)
-        if r.status_code == 409:
-            _raise_conversation_conflict(r, conversation)
-        r.raise_for_status()
-
         # Pre-flight every RecordedAudio reference before creating the
         # Replay row — a missing file later would leave an orphan.
         _check_recorded_audio_exists(conversation)
 
+        # 1. Upsert Conversation (multipart). Server hashes the canonical
+        # turn JSON (with sha256 substituted for each RecordedAudio's bytes)
+        # and returns the conversation hash. The SDK never hashes anything.
+        spec = conversation.to_conversation_spec_payload()
+        with _open_recorded_audio_files(conversation) as audio_files:
+            # `files=` (with spec as a string field) forces httpx to encode
+            # multipart/form-data even when no RecordedAudio turns are present;
+            # passing `data={"spec": ...}` alongside an empty `files=` would
+            # collapse to x-www-form-urlencoded and the server would 400 it.
+            files: list[tuple[str, tuple[str | None, str | io.BufferedReader, str]]] = [
+                ("spec", (None, json.dumps(spec, separators=(",", ":")), "application/json")),
+                *audio_files,
+            ]
+            r = await client.post("/v1/conversations", files=files)
+            try:
+                r.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                # Failure before the replay row exists — no PATCH path to surface
+                # `failure_reason` through. Wrap in a typed XrayError so the dev
+                # sees an SDK contract violation, not a raw httpx exception.
+                raise XrayServerError(
+                    f"POST /v1/conversations failed: {e.response.status_code} {e.response.text[:500]}",
+                    status_code=e.response.status_code,
+                ) from e
+        conversation_upsert = _read_conversation_upsert_response(r.json())
+        conversation_hash = conversation_upsert.hash
+
         # 2. Create Replay eagerly so the runtime can propagate the id.
-        create_body: ReplayCreateBody = {
-            "conversation_id": conversation.id,
-            "conversation_version": conversation.version,
-        }
+        create_body: ReplayCreateBody = {"conversation_hash": conversation_hash}
         if run_config is not None:
             create_body["run_config"] = run_config.to_wire()
         r = await client.post("/v1/replays", json=create_body)
-        r.raise_for_status()
-        replay_id = _read_replay_id(r.json())
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise XrayServerError(
+                f"POST /v1/replays failed: {e.response.status_code} {e.response.text[:500]}",
+                status_code=e.response.status_code,
+            ) from e
+        replay_create = _read_replay_create_response(r.json())
+        replay_id = replay_create.id
 
-        # 3. Bind runtime.
+        # 2. Bind runtime.
         if isinstance(runtime, RuntimeBindable):
             runtime.bind(
                 replay_id=replay_id,
-                conversation_id=conversation.id,
-                conversation_version=conversation.version,
+                conversation_hash=conversation_hash,
             )
 
-        # 3b. Wire the driver-side OTEL pipeline. Mirrors what
+        # 2b. Wire the driver-side OTEL pipeline. Mirrors what
         # ``xray.attach`` does on the agent side — install the OTLP/JSON
         # exporter + baggage processor, set the replay-scope baggage so
         # spans emitted by the runtime (e.g. ``xray.turn`` for user
@@ -173,12 +208,11 @@ async def run(
         tracer_provider: TracerProvider = install_otel(endpoint=xray_url)
         baggage_token: contextvars.Token[Context] = attach_replay_baggage(
             replay_id=replay_id,
-            conversation_id=conversation.id,
-            conversation_version=conversation.version,
+            conversation_hash=conversation_hash,
             modality="voice",
         )
 
-        # 4. Run the runtime. Typed errors surface their own
+        # 3. Run the runtime. Typed errors surface their own
         # `failure_reason`; everything else falls through to a generic
         # `driver_aborted` PATCH — no substring matching, per the
         # restructure contract.
@@ -201,7 +235,7 @@ async def run(
             tracer_provider.force_flush(timeout_millis=10_000)
             otel_context.detach(baggage_token)
 
-        # 5. Upload mixdown if produced.
+        # 4. Upload mixdown if produced.
         if (
             runtime_result is not None
             and runtime_result.full_audio_path is not None
@@ -267,7 +301,7 @@ async def run(
                     )
                     status = "failed"
 
-        # 6. Fetch the rich per-turn view and merge into each agent
+        # 5. Fetch the rich per-turn view and merge into each agent
         # response so assertions see tool_calls / model_usage / stage
         # timings.
         responses: list[AgentResponse] = (
@@ -278,7 +312,7 @@ async def run(
             conversation=conversation, responses=responses, enrichment=enrichment
         )
 
-        # 7. Per-turn assertions.
+        # 6. Per-turn assertions.
         assertions: list[AssertionOutcome] = []
         turn_records: list[TurnRecord] = []
         for idx, (turn, response) in enumerate(zip(conversation.turns, responses, strict=True)):
@@ -296,29 +330,27 @@ async def run(
                 assertions.append(outcome)
             turn_records.append(record)
 
-        # 8. Judge.
-        judge_outcome: JudgeOutcome | None = None
+        # 7. Judge.
         if conversation.judge is not None and status == "completed":
             replay_result = ReplayResult(
-                conversation_id=conversation.id,
-                conversation_version=conversation.version,
+                conversation_hash=conversation_hash,
+                name=conversation.name,
                 turns=turn_records,
                 transcript=(runtime_result.full_transcript if runtime_result is not None else None),
             )
-            judge_outcome = await _evaluate_judge(conversation.judge, replay_result)
+            await _evaluate_judge(conversation.judge, replay_result)
 
-        # 9. PATCH.
+        # 8. PATCH.
         patch_body = _build_patch_body(status=status, failure_reason=failure_reason)
         r = await client.patch(f"/v1/replays/{replay_id}", json=patch_body)
         r.raise_for_status()
 
         return RunResult(
             id=replay_id,
-            conversation_id=conversation.id,
-            conversation_version=conversation.version,
+            conversation_hash=conversation_hash,
+            name=conversation.name,
             status=status,
             assertions=assertions,
-            judge=judge_outcome,
             url=f"{xray_url}/replays/{replay_id}",
         )
 
@@ -326,11 +358,31 @@ async def run(
 # ─── Helpers ──────────────────────────────────────────────────────────
 
 
-def _read_replay_id(raw: object) -> str:
+def _read_replay_create_response(raw: object) -> _ReplayCreateResponse:
     try:
-        return _ReplayCreateResponse.model_validate(raw).id
+        return _ReplayCreateResponse.model_validate(raw)
     except ValidationError as e:
         raise XrayError(f"POST /v1/replays response malformed: {e}") from e
+
+
+def _read_conversation_upsert_response(raw: object) -> _ConversationUpsertResponse:
+    try:
+        return _ConversationUpsertResponse.model_validate(raw)
+    except ValidationError as e:
+        raise XrayError(f"POST /v1/conversations response malformed: {e}") from e
+
+
+async def _evaluate_judge(judge: JudgePredicate, replay_result: ReplayResult) -> object:
+    """Invoke the conversation-level judge with the assembled ReplayResult.
+
+    The return value is currently unused — judges side-effect into their own
+    tracking systems. Defined here so behavior stays in one place when the
+    SDK eventually surfaces judge outcomes back to the dev.
+    """
+    outcome = judge(replay_result)
+    if inspect.isawaitable(outcome):
+        return await outcome
+    return outcome
 
 
 def _build_patch_body(
@@ -427,24 +479,6 @@ async def _upload_replay_audio(
     response.raise_for_status()
 
 
-class _ConversationConflictBody(BaseModel):
-    """Best-effort narrow of the snake_case 409 response."""
-
-    conversation_id: str | None = None
-    conversation_version: str | None = None
-
-
-def _raise_conversation_conflict(response: httpx.Response, conversation: Conversation) -> None:
-    try:
-        body = _ConversationConflictBody.model_validate(response.json())
-    except (ValueError, ValidationError):
-        body = _ConversationConflictBody()
-    raise VersionFingerprintMismatchError(
-        body.conversation_id or conversation.id,
-        body.conversation_version or conversation.version,
-    )
-
-
 def _check_recorded_audio_exists(conversation: Conversation) -> None:
     for idx, turn in enumerate(conversation.turns):
         audio = turn.audio
@@ -453,6 +487,23 @@ def _check_recorded_audio_exists(conversation: Conversation) -> None:
         path = Path(audio.path)
         if not path.is_file():
             raise AudioMissingError(f"recorded audio file not found: {path}", turn_idx=idx)
+
+
+@contextmanager
+def _open_recorded_audio_files(
+    conversation: Conversation,
+) -> Generator[list[tuple[str, tuple[str, io.BufferedReader, str]]], None, None]:
+    """Yield an httpx ``files=`` list with each RecordedAudio opened binary.
+
+    Format: ``[(upload_key, (filename, fileobj, mime))]``. ExitStack closes
+    every handle in LIFO order on exit, exception or not.
+    """
+    with ExitStack() as stack:
+        files = [
+            (upload_key, (Path(p).name, stack.enter_context(Path(p).open("rb")), "audio/wav"))
+            for upload_key, p in conversation.recorded_audio_uploads()
+        ]
+        yield files
 
 
 async def _evaluate_assertion(
@@ -469,16 +520,6 @@ async def _evaluate_assertion(
         return AssertionOutcome(name=name, status="passed" if result else "failed")
     except Exception as e:
         return AssertionOutcome(name=name, status="errored", message=str(e))
-
-
-async def _evaluate_judge(predicate: JudgePredicate, replay: ReplayResult) -> JudgeOutcome:
-    try:
-        result = predicate(replay)
-        if inspect.isawaitable(result):
-            return await result
-        return result
-    except Exception as e:
-        return JudgeOutcome(status="errored", error=str(e))
 
 
 # ─── Server enrichment (tool calls + model usage + stage timings) ────
@@ -648,7 +689,6 @@ def _merge_enrichment_into_responses(
 
 __all__ = [
     "MAX_AUDIO_BYTES",
-    "ReplayCreateBody",
     "ReplayPatchBody",
     "ReplayStatus",
     "RunResult",

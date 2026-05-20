@@ -73,8 +73,7 @@ interface PlayedSegment {
 	endMs: number;
 }
 
-const CONVERSATION_ID = "demo-booking-happy-path";
-const CONVERSATION_VERSION = "v0001";
+const CONVERSATION_NAME = "Books a table for two — happy path";
 const REPLAY_COUNT = 3;
 
 const TURNS: SeedTurn[] = [
@@ -129,43 +128,23 @@ const TTS_VOICE_FOR_ROLE: Record<"user" | "agent", string> = {
 };
 
 async function main() {
-	await postConversation();
+	let conversationHash = "";
 	for (let i = 0; i < REPLAY_COUNT; i++) {
-		const replayId = await postReplay(i);
-		await pushOtlp(replayId, i);
-		await uploadReplayAudio(replayId, i);
-		await patchReplay(replayId, i);
+		const created = await postReplay(i);
+		conversationHash = created.conversationHash;
+		await pushOtlp(created.id, i, conversationHash);
+		await uploadReplayAudio(created.id, i);
+		await patchReplay(created.id, i);
 	}
-	console.info(`seeded ${REPLAY_COUNT} replays under ${CONVERSATION_ID}`);
+	console.info(
+		`seeded ${REPLAY_COUNT} replays under conversation ${conversationHash.slice(0, 12)}…`,
+	);
 }
 
-async function postConversation() {
+async function postReplay(idx: number): Promise<{ id: string; conversationHash: string }> {
 	const body = {
-		id: CONVERSATION_ID,
-		version: CONVERSATION_VERSION,
-		title: "Books a table for two — happy path",
+		name: CONVERSATION_NAME,
 		turns: TURNS,
-	};
-	const res = await fetch(`${BASE}/v1/conversations`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(body),
-	});
-	if (!res.ok) {
-		throw new SeedRequestError(
-			"POST",
-			"/v1/conversations",
-			res.status,
-			res.statusText,
-			await res.text(),
-		);
-	}
-}
-
-async function postReplay(idx: number): Promise<string> {
-	const body = {
-		conversation_id: CONVERSATION_ID,
-		conversation_version: CONVERSATION_VERSION,
 		modality: "voice",
 		run_config: {
 			model: idx % 2 === 0 ? "gpt-4o" : "gpt-4o-mini",
@@ -180,11 +159,14 @@ async function postReplay(idx: number): Promise<string> {
 	if (!res.ok) {
 		throw new SeedRequestError("POST", "/v1/replays", res.status, res.statusText, await res.text());
 	}
-	const parsed = v.parse(v.object({ id: v.string() }), await res.json());
-	return parsed.id;
+	const parsed = v.parse(
+		v.object({ id: v.string(), conversation_hash: v.string() }),
+		await res.json(),
+	);
+	return { id: parsed.id, conversationHash: parsed.conversation_hash };
 }
 
-async function pushOtlp(replayId: string, idx: number) {
+async function pushOtlp(replayId: string, idx: number, conversationHash: string) {
 	const replayStartMs = Date.UTC(2026, 4, 18 + idx, 12, 0, 0);
 	const lastEnd = PLAYED.at(-1)?.endMs ?? 0;
 	const judgeStart = lastEnd + 100;
@@ -194,8 +176,7 @@ async function pushOtlp(replayId: string, idx: number) {
 				resource: {
 					attributes: [
 						kv("xray.replay.id", replayId),
-						kv("xray.conversation.id", CONVERSATION_ID),
-						kv("xray.conversation.version", CONVERSATION_VERSION),
+						kv("xray.conversation.hash", conversationHash),
 						kv("xray.modality", "voice"),
 					],
 				},

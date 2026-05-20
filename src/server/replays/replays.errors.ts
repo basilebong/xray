@@ -53,20 +53,26 @@ export class ReplayNotFoundError extends ReplayError {
 	}
 }
 
-export class ConversationVersionNotFoundError extends ReplayError {
-	readonly conversationId: string;
-	readonly conversationVersion: string;
-	constructor(conversationId: string, conversationVersion: string) {
-		super(`Conversation "${conversationId}" version "${conversationVersion}" not found`);
-		this.name = "ConversationVersionNotFoundError";
-		this.conversationId = conversationId;
-		this.conversationVersion = conversationVersion;
+/**
+ * A POST /v1/replays referenced a `conversation_hash` that does not exist.
+ * The dev must POST /v1/conversations first (the SDK does this automatically
+ * when it calls `xray.run`).
+ */
+export class ConversationHashNotFoundError extends ReplayError {
+	readonly conversationHash: string;
+	constructor(conversationHash: string) {
+		super(`Conversation "${conversationHash}" not found`);
+		this.name = "ConversationHashNotFoundError";
+		this.conversationHash = conversationHash;
 	}
 }
 
 /**
  * A PATCH attempted to move the replay out of a terminal lifecycle state.
- * Terminal states (`completed`, `failed`) are write-once.
+ * Terminal states (`completed`, `failed`) are write-once. The SDK is the
+ * sole writer for non-server-owned transitions and only emits one terminal
+ * PATCH per run — a follow-up PATCH that "rescues" or rewrites the outcome
+ * would mask whatever flagged it.
  */
 export class ReplayLifecycleTransitionError extends ReplayError {
 	readonly replayId: string;

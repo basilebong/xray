@@ -7,7 +7,6 @@ import * as v from "valibot";
 
 import {
 	BodyTooLargeResponseSchema,
-	ConversationNotFoundResponseSchema,
 	openApiSchemaFromValibot,
 	ReplayNotFoundResponseSchema,
 	ValidationErrorResponseSchema,
@@ -17,7 +16,6 @@ import { sanitizeIssues } from "@/server/sanitize-issues/sanitize-issues.ts";
 import type { Store } from "@/server/store/store.ts";
 
 import {
-	ConversationVersionNotFoundError,
 	InvalidCompareSelectionError,
 	InvalidReplayIdError,
 	InvalidReplayRequestError,
@@ -48,7 +46,10 @@ import {
 	UpdateReplayRequestSchema,
 } from "./replays.types.ts";
 
-const MAX_REPLAY_BODY_BYTES = 64 * 1024;
+// Spec-payload limit only: the request embeds the full Conversation spec
+// (turns array). The stereo audio upload uses its own endpoint with its own
+// (much larger) cap. 256 KB matches MAX_CONVERSATION_BODY_BYTES.
+const MAX_REPLAY_BODY_BYTES = 256 * 1024;
 const MAX_COMPARE_BODY_BYTES = 16 * 1024;
 
 export function createReplaysRouter(
@@ -64,7 +65,7 @@ export function createReplaysRouter(
 			tags: ["Replays"],
 			summary: "Start a Replay",
 			description:
-				"Creates the Replay row eagerly so the SDK can propagate `xray.replay.id` as OTEL baggage on the LiveKit room metadata BEFORE the dev's agent emits its first span. Returns the full detail row with `status='running'`.",
+				"Embeds the full Conversation spec (`name` + `turns`). The server computes the content hash from `turns` and upserts the conversation row by hash (last-write-wins on `name`) before creating the Replay row. Returns the detail with `status='running'` so the SDK can propagate `xray.replay.id` to the voice service before any agent spans flow.",
 			requestBody: {
 				required: true,
 				content: {
@@ -84,14 +85,6 @@ export function createReplaysRouter(
 					description: "Body failed validation.",
 					content: {
 						"application/json": { schema: openApiSchemaFromValibot(ValidationErrorResponseSchema) },
-					},
-				},
-				"404": {
-					description: "(conversation_id, conversation_version) not found — POST it first.",
-					content: {
-						"application/json": {
-							schema: openApiSchemaFromValibot(ConversationNotFoundResponseSchema),
-						},
 					},
 				},
 				"413": {
@@ -117,7 +110,7 @@ export function createReplaysRouter(
 			}
 			const parsed = v.safeParse(CreateReplayRequestSchema, raw);
 			if (!parsed.success) throw new InvalidReplayRequestError(parsed.issues);
-			const detail = createReplay(store, parsed.output);
+			const detail = await createReplay(store, parsed.output);
 			return c.json(detail, 201);
 		},
 	);
@@ -478,16 +471,6 @@ export function createReplaysRouter(
 			)
 			.with(P.instanceOf(ReplayBodyTooLargeError), (e) =>
 				c.json({ error: "body_too_large", max_bytes: e.maxBytes }, 413),
-			)
-			.with(P.instanceOf(ConversationVersionNotFoundError), (e) =>
-				c.json(
-					{
-						error: "conversation_not_found",
-						conversation_id: e.conversationId,
-						conversation_version: e.conversationVersion,
-					},
-					404,
-				),
 			)
 			.with(P.instanceOf(ReplayNotFoundError), (e) =>
 				c.json({ error: "replay_not_found", replay_id: e.replayId }, 404),

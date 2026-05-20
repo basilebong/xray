@@ -207,7 +207,7 @@ def _runtime(
         _lk_api=lk_api,
         _openai_tts=openai_tts,
     )
-    rt.bind(replay_id="rep-1", conversation_id="conv-1", conversation_version="v1")
+    rt.bind(replay_id="rep-1", conversation_hash="a" * 64)
     return rt
 
 
@@ -216,7 +216,7 @@ def _runtime(
 
 def test_bind_required_before_run():
     rt = LiveKitDriver(url="x", api_key="k", api_secret="s", room="r")
-    conv = Conversation(id="c", turns=[Turn.user("hi")])
+    conv = Conversation(name="c", turns=[Turn.user("hi")])
     with pytest.raises(RuntimeBindError) as exc:
         asyncio.run(rt.run(conv))
     assert exc.value.failure_reason == "driver_aborted"
@@ -274,7 +274,7 @@ def test_runtime_publishes_recorded_user_turn_and_produces_mixdown(tmp_path: Pat
     rt = _runtime(tmp_path, rtc, api)
 
     conv = Conversation(
-        id="c",
+        name="c",
         turns=[Turn.user("hi", key="u0", audio=RecordedAudio(path=str(wav_path)))],
     )
 
@@ -307,7 +307,7 @@ def test_runtime_captures_agent_turn_via_transcription(tmp_path: Path):
     rt.agent_turn_timeout_s = 2.0
 
     conv = Conversation(
-        id="c",
+        name="c",
         turns=[
             Turn.user("hello", key="u0", audio=RecordedAudio(path=str(wav_path))),
             Turn.agent(key="a0"),
@@ -339,7 +339,7 @@ def test_runtime_raises_agent_not_joined_on_timeout(tmp_path: Path):
     rt = _runtime(tmp_path, rtc, api)
     rt.agent_join_timeout_s = 0.05
 
-    conv = Conversation(id="c", turns=[Turn.user("hi")])
+    conv = Conversation(name="c", turns=[Turn.user("hi")])
 
     with pytest.raises(AgentNotJoinedError) as exc:
         asyncio.run(rt.run(conv))
@@ -374,7 +374,7 @@ def test_user_turn_emits_xray_turn_span(tmp_path: Path, monkeypatch: pytest.Monk
     rt = _runtime(tmp_path, rtc, api)
 
     conv = Conversation(
-        id="c",
+        name="c",
         turns=[Turn.user("hello there", key="u0", audio=RecordedAudio(path=str(wav_path)))],
     )
     asyncio.run(rt.run(conv))
@@ -428,7 +428,7 @@ def test_driver_emits_xray_turn_for_user_and_agent(tmp_path: Path, monkeypatch: 
     rt.agent_turn_timeout_s = 2.0
 
     conv = Conversation(
-        id="c",
+        name="c",
         turns=[
             Turn.user("hello", key="u0", audio=RecordedAudio(path=str(wav_path))),
             Turn.agent(key="a0"),
@@ -482,7 +482,7 @@ def test_tts_path_uses_openai_injection_and_caches(tmp_path: Path):
     rt1 = _runtime(tmp_path, rtc1, api1, openai_tts=_fake_tts)
 
     conv = Conversation(
-        id="conv-x",
+        name="conv-x",
         turns=[Turn.user("hello world", key="u0", audio=TtsAudio())],
     )
 

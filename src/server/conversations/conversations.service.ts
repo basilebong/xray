@@ -1,14 +1,12 @@
-import { and, asc, count, desc, eq, max } from "drizzle-orm";
+import { count, eq } from "drizzle-orm";
 import * as v from "valibot";
 
 import { conversations, replays } from "@/server/store/schema.ts";
 import type { Store } from "@/server/store/store.ts";
 import type { ConversationRow } from "@/server/store/types.ts";
 
-import { VersionFingerprintMismatchError } from "./conversations.errors.ts";
 import type {
 	ConversationResponse,
-	ConversationSpec,
 	ConversationSummary,
 	ConversationTurn,
 } from "./conversations.types.ts";
@@ -17,48 +15,72 @@ import { ConversationTurnSchema } from "./conversations.types.ts";
 const TurnArraySchema = v.array(ConversationTurnSchema);
 
 /**
- * Upsert a Conversation row keyed by `(id, version)`.
+ * Compute the canonical encoding of a turn array used as the input to the
+ * conversation hash. Both the SDK and server must produce bit-identical
+ * bytes here; a parity fixture (`tests/fixtures/hash-parity.json`) pins
+ * the contract.
  *
- * Idempotent: re-POSTing the same `(id, version)` with byte-identical
- * `turns_json` returns the existing row. POSTing the same `(id, version)`
- * with different turn content throws `VersionFingerprintMismatchError` —
- * the dev forgot to bump version after editing the spec.
- *
- * The fingerprint is the canonical JSON-stringified turn array; the SDK
- * computes the same string before sending so a "trivial reorder" upstream
- * is still caught.
+ * Rules: sorted keys, no whitespace, ASCII-safe (any non-ASCII is escaped).
  */
-export function upsertConversation(
+export function canonicalizeTurns(turns: readonly ConversationTurn[]): string {
+	return canonicalStringify(turns);
+}
+
+/**
+ * SHA-256 hex (64-char lowercase) over `canonicalizeTurns(turns)`. The
+ * SDK computes the same hash before POSTing; the server recomputes from
+ * the embedded spec on the wire — never trusts an SDK-computed value.
+ */
+export async function computeConversationHash(turns: readonly ConversationTurn[]): Promise<string> {
+	return (await canonicalizeAndHashTurns(turns)).hash;
+}
+
+/**
+ * Single walk over the turn tree: returns both the canonical JSON and its
+ * SHA-256 hex. `createReplay` uses this so the bytes stored in `turns_json`
+ * are byte-identical to the bytes that produced the conversation hash —
+ * and the tree is walked once, not twice.
+ */
+export async function canonicalizeAndHashTurns(
+	turns: readonly ConversationTurn[],
+): Promise<{ json: string; hash: string }> {
+	const json = canonicalizeTurns(turns);
+	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(json));
+	const hash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+	return { json, hash };
+}
+
+/**
+ * Idempotent upsert of a Conversation row keyed by `hash`. On first POST
+ * inserts; on subsequent POSTs with the same hash, updates `name`
+ * (last-write-wins on display label) and `last_run_at` (denormalized for
+ * list ordering).
+ */
+export function ensureConversation(
 	store: Store,
-	spec: ConversationSpec,
-	now: () => string = () => new Date().toISOString(),
+	hash: string,
+	name: string,
+	turnsJson: string,
+	now: string,
 ): ConversationRow {
-	const turnsJson = canonicalizeTurns(spec.turns);
-	const existing = store.db
-		.select()
-		.from(conversations)
-		.where(and(eq(conversations.id, spec.id), eq(conversations.version, spec.version)))
-		.get();
+	const existing = store.db.select().from(conversations).where(eq(conversations.hash, hash)).get();
 	if (existing !== undefined) {
-		if (existing.turnsJson !== turnsJson) {
-			throw new VersionFingerprintMismatchError(spec.id, spec.version);
-		}
-		return existing;
+		store.db
+			.update(conversations)
+			.set({ name, lastRunAt: now })
+			.where(eq(conversations.hash, hash))
+			.run();
+		return { ...existing, name, lastRunAt: now };
 	}
 	const row: ConversationRow = {
-		id: spec.id,
-		version: spec.version,
+		hash,
+		name,
 		turnsJson,
-		title: spec.title ?? null,
-		createdAt: now(),
+		createdAt: now,
+		lastRunAt: now,
 	};
 	store.db.insert(conversations).values(row).run();
 	return row;
-}
-
-/** Stable canonical encoding of turn structure used as the version fingerprint. */
-export function canonicalizeTurns(turns: readonly ConversationTurn[]): string {
-	return JSON.stringify(turns);
 }
 
 function parseStoredTurns(raw: string): ConversationTurn[] {
@@ -77,94 +99,88 @@ function parseStoredTurns(raw: string): ConversationTurn[] {
 /** Project a stored row back onto the wire response shape. */
 export function toConversationResponse(row: ConversationRow): ConversationResponse {
 	return {
-		id: row.id,
-		version: row.version,
-		title: row.title,
+		hash: row.hash,
+		name: row.name,
 		created_at: row.createdAt,
+		last_run_at: row.lastRunAt,
 		turns: parseStoredTurns(row.turnsJson),
 	};
 }
 
-/**
- * List one row per distinct `id` — for each id, the latest version's
- * metadata plus the count of versions and the count of replays across all
- * versions. Sorted newest-first.
- */
+/** List all conversations, newest-active first. One row per hash. */
 export function listConversations(store: Store): ConversationSummary[] {
-	// Two queries; the join would multiply row counts and force GROUP BY
-	// gymnastics. The conversation list is small (per-dev), so two indexed
-	// scans are fine.
-	const versionRows = store.db
-		.select({
-			id: conversations.id,
-			latestCreatedAt: max(conversations.createdAt),
-			versions: count(),
-		})
-		.from(conversations)
-		.groupBy(conversations.id)
-		.all();
-
+	const rows = store.db.select().from(conversations).all();
 	const replayCountRows = store.db
-		.select({ conversationId: replays.conversationId, replays: count() })
+		.select({ conversationHash: replays.conversationHash, n: count() })
 		.from(replays)
-		.groupBy(replays.conversationId)
+		.groupBy(replays.conversationHash)
 		.all();
-	const replayCounts = new Map(replayCountRows.map((r) => [r.conversationId, r.replays] as const));
-
-	const summaries: ConversationSummary[] = [];
-	for (const row of versionRows) {
-		if (row.latestCreatedAt === null) continue;
-		const latest = store.db
-			.select()
-			.from(conversations)
-			.where(and(eq(conversations.id, row.id), eq(conversations.createdAt, row.latestCreatedAt)))
-			.get();
-		if (latest === undefined) continue;
-		summaries.push({
-			id: row.id,
-			latest_version: latest.version,
-			title: latest.title,
-			created_at: latest.createdAt,
-			versions: row.versions,
-			replays: replayCounts.get(row.id) ?? 0,
-		});
-	}
-	summaries.sort((a, b) =>
-		a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0,
-	);
+	const replayCounts = new Map(replayCountRows.map((r) => [r.conversationHash, r.n] as const));
+	const summaries: ConversationSummary[] = rows.map((row) => ({
+		hash: row.hash,
+		name: row.name,
+		created_at: row.createdAt,
+		last_run_at: row.lastRunAt,
+		replays: replayCounts.get(row.hash) ?? 0,
+	}));
+	summaries.sort((a, b) => {
+		const ax = a.last_run_at ?? a.created_at;
+		const bx = b.last_run_at ?? b.created_at;
+		return ax < bx ? 1 : ax > bx ? -1 : 0;
+	});
 	return summaries;
 }
 
-/** Get the latest version of a conversation, or undefined. */
-export function getLatestConversation(store: Store, id: string): ConversationRow | undefined {
-	return store.db
-		.select()
-		.from(conversations)
-		.where(eq(conversations.id, id))
-		.orderBy(desc(conversations.createdAt))
-		.limit(1)
-		.get();
+export function getConversationByHash(store: Store, hash: string): ConversationRow | undefined {
+	return store.db.select().from(conversations).where(eq(conversations.hash, hash)).get();
 }
 
-/** Get one specific `(id, version)` or undefined. */
-export function getConversationVersion(
-	store: Store,
-	id: string,
-	version: string,
-): ConversationRow | undefined {
-	return store.db
-		.select()
-		.from(conversations)
-		.where(and(eq(conversations.id, id), eq(conversations.version, version)))
-		.get();
+/**
+ * Canonical JSON: sorted keys, no whitespace, ASCII-only output. Mirrors
+ * Python's `json.dumps(..., separators=(",", ":"), sort_keys=True,
+ * ensure_ascii=True)`. Used for the conversation hash; the parity fixture
+ * exercises it.
+ */
+function canonicalStringify(value: unknown): string {
+	if (value === null) return "null";
+	if (typeof value === "boolean") return value ? "true" : "false";
+	if (typeof value === "number") {
+		if (!Number.isFinite(value)) {
+			throw new TypeError("Cannot canonicalize non-finite number");
+		}
+		return JSON.stringify(value);
+	}
+	if (typeof value === "string") return escapeAscii(value);
+	if (Array.isArray(value)) {
+		const parts = value.map((item) => canonicalStringify(item));
+		return `[${parts.join(",")}]`;
+	}
+	if (typeof value === "object") {
+		const entries = Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+		const parts = entries.map(([k, val]) => `${escapeAscii(k)}:${canonicalStringify(val)}`);
+		return `{${parts.join(",")}}`;
+	}
+	throw new TypeError(`Cannot canonicalize value of type ${typeof value}`);
 }
 
-/** All versions of a conversation, oldest-first. */
-export function listConversationVersions(store: Store, id: string): ConversationRow[] {
-	return store.db
-		.select()
-		.from(conversations)
-		.where(eq(conversations.id, id))
-		.orderBy(asc(conversations.createdAt))
-		.all();
+/** ASCII-safe JSON string escape. Matches Python's `ensure_ascii=True`. */
+function escapeAscii(s: string): string {
+	let out = '"';
+	for (let i = 0; i < s.length; i++) {
+		const code = s.charCodeAt(i);
+		if (code === 0x22) out += '\\"';
+		else if (code === 0x5c) out += "\\\\";
+		else if (code === 0x08) out += "\\b";
+		else if (code === 0x09) out += "\\t";
+		else if (code === 0x0a) out += "\\n";
+		else if (code === 0x0c) out += "\\f";
+		else if (code === 0x0d) out += "\\r";
+		else if (code < 0x20 || code > 0x7e) {
+			out += `\\u${code.toString(16).padStart(4, "0")}`;
+		} else {
+			out += s[i];
+		}
+	}
+	out += '"';
+	return out;
 }

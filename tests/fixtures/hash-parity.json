@@ -1,0 +1,9 @@
+{
+  "description": "Cross-language parity fixture. Both the Python SDK and the TS server hash `turns` into `expected_hash`. Pins the canonical-JSON wire contract.",
+  "canonical_json": "[{\"key\":\"u0\",\"role\":\"user\",\"text\":\"hello\"},{\"key\":\"a0\",\"role\":\"agent\"}]",
+  "turns": [
+    { "role": "user", "text": "hello", "key": "u0" },
+    { "role": "agent", "key": "a0" }
+  ],
+  "expected_hash": "40a03beafd3bfba706fd71df15824bcb43ba328f6cd1327f8303b6754d6071a8"
+}

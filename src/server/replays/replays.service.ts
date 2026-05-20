@@ -1,6 +1,6 @@
 import { and, desc, eq } from "drizzle-orm";
 
-import { getConversationVersion } from "@/server/conversations/conversations.service.ts";
+import { getConversationByHash } from "@/server/conversations/conversations.service.ts";
 import type { JobRunner } from "@/server/jobs/jobs.bunqueue.ts";
 import {
 	modelUsage,
@@ -23,7 +23,7 @@ import type {
 } from "@/server/store/types.ts";
 
 import {
-	ConversationVersionNotFoundError,
+	ConversationHashNotFoundError,
 	ReplayLifecycleTransitionError,
 	ReplayNotFoundError,
 	ReplayNotReadyForAnalysisError,
@@ -52,16 +52,15 @@ export function createReplay(
 	opts: CreateReplayOptions = {},
 ): ReplayDetailResponse {
 	const now = opts.now ?? (() => new Date().toISOString());
-	const conv = getConversationVersion(store, req.conversation_id, req.conversation_version);
+	const conv = getConversationByHash(store, req.conversation_hash);
 	if (conv === undefined) {
-		throw new ConversationVersionNotFoundError(req.conversation_id, req.conversation_version);
+		throw new ConversationHashNotFoundError(req.conversation_hash);
 	}
 	const id = opts.id ?? crypto.randomUUID();
 	const startedAt = now();
 	const replayRow: ReplayRow = {
 		id,
-		conversationId: req.conversation_id,
-		conversationVersion: req.conversation_version,
+		conversationHash: req.conversation_hash,
 		lifecycleState: "pending",
 		analysisStep: null,
 		failureReason: null,
@@ -132,12 +131,12 @@ export function compareReplays(store: Store, ids: readonly string[]): CompareRep
 
 export function listReplaysForConversation(
 	store: Store,
-	conversationId: string,
+	conversationHash: string,
 ): ReplaySummaryResponse[] {
 	const rows = store.db
 		.select()
 		.from(replays)
-		.where(eq(replays.conversationId, conversationId))
+		.where(eq(replays.conversationHash, conversationHash))
 		.orderBy(desc(replays.startedAt))
 		.all();
 	return rows.map(toSummary);
@@ -146,8 +145,7 @@ export function listReplaysForConversation(
 function toSummary(r: ReplayRow): ReplaySummaryResponse {
 	return {
 		id: r.id,
-		conversation_id: r.conversationId,
-		conversation_version: r.conversationVersion,
+		conversation_hash: r.conversationHash,
 		lifecycle_state: r.lifecycleState,
 		analysis_step: r.analysisStep,
 		failure_reason: r.failureReason,
@@ -178,8 +176,7 @@ function buildReplayDetail(store: Store, id: string): ReplayDetailResponse {
 	spanRows.sort((a, b) => (a.startedAt < b.startedAt ? -1 : a.startedAt > b.startedAt ? 1 : 0));
 	return {
 		id: r.id,
-		conversation_id: r.conversationId,
-		conversation_version: r.conversationVersion,
+		conversation_hash: r.conversationHash,
 		lifecycle_state: r.lifecycleState,
 		analysis_step: r.analysisStep,
 		failure_reason: r.failureReason,
@@ -323,21 +320,6 @@ export function markReplayFailed(
  * POST /v1/replays/:id/analyze handler. Atomically claims the analyzing
  * lifecycle for this replay before enqueuing, so two concurrent /analyze
  * calls for the same id can't both schedule bunqueue jobs.
- *
- * Order matters:
- *   1. Pre-check via findReplay so a 404 / 409 lands without touching the
- *      DB write path.
- *   2. Conditional UPDATE: `set lifecycle_state='analyzing' where
- *      lifecycle_state='recording_uploaded'`. SQLite's single-writer
- *      serializes this — only one concurrent caller flips the row.
- *   3. Re-read to confirm we hold the claim. If the row is in any other
- *      state, another caller raced — surface `ReplayNotReadyForAnalysisError`
- *      with the current state.
- *   4. Enqueue. On failure, rollback the UPDATE so the operator can retry
- *      without the row being permanently stuck in `analyzing`.
- *   5. Stamp the bunqueue jobId.
- *
- * Emits a `state` event after the claim + enqueue both succeed.
  */
 export async function enqueueAnalysis(
 	store: Store,

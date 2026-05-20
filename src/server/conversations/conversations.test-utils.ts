@@ -1,6 +1,4 @@
-import type { ConversationSpec, ConversationTurn } from "./conversations.types.ts";
-
-let counter = 0;
+import type { ConversationTurn } from "./conversations.types.ts";
 
 export function makeConversationTurn(overrides: Partial<ConversationTurn> = {}): ConversationTurn {
 	return {
@@ -10,15 +8,14 @@ export function makeConversationTurn(overrides: Partial<ConversationTurn> = {}):
 	};
 }
 
-export function makeConversationSpec(overrides: Partial<ConversationSpec> = {}): ConversationSpec {
-	counter += 1;
-	return {
-		id: `conv-${counter}`,
-		version: "v0001",
-		turns: [
-			makeConversationTurn({ role: "user", text: "hi", key: "u0" }),
-			makeConversationTurn({ role: "agent", key: "a0" }),
-		],
-		...overrides,
-	};
+export interface MakeTurnsOptions {
+	turns?: ConversationTurn[];
+}
+
+export function makeTurns(opts: MakeTurnsOptions = {}): ConversationTurn[] {
+	if (opts.turns !== undefined) return opts.turns;
+	return [
+		makeConversationTurn({ role: "user", text: "hi", key: "u0" }),
+		makeConversationTurn({ role: "agent", key: "a0" }),
+	];
 }
