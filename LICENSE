@@ -144,8 +144,10 @@ CC0-1.0, Python-2.0 (PSF), or OFL-1.1 for fonts. The `NOTICE` file
 in the repository root enumerates the categories and gives
 attribution where the license requires it.
 
-`bun run license:check` walks `pnpm licenses list --prod --json` and
-fails the build if any production dependency is under GPL-*, AGPL-*,
-or SSPL-*. The same script runs in CI in the `Supply-chain audit`
-job, so a PR that adds a copyleft dependency is rejected before
-merge.
+The `Supply-chain audit` workflow runs GitHub's
+`actions/dependency-review-action` on every pull request with an
+explicit `deny-licenses` list covering GPL-*, AGPL-*, and SSPL-*.
+A PR that introduces a dependency under any of those licenses fails
+the check and is rejected before merge. LGPL is deliberately not in
+the deny list: it carries linking caveats but is compatible with
+redistributing a bundled image.
