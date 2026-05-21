@@ -1,4 +1,5 @@
 import { count, eq } from "drizzle-orm";
+import { match, P } from "ts-pattern";
 import * as v from "valibot";
 
 import { conversations, replays } from "@/server/store/schema.ts";
@@ -12,35 +13,7 @@ import type {
 	ConversationTurn,
 	ConversationTurnRequest,
 } from "./conversations.types.ts";
-import { ConversationTurnSchema } from "./conversations.types.ts";
-
-const TurnArraySchema = v.array(ConversationTurnSchema);
-
-/**
- * Translate one request-form turn into its canonical/stored form. For a
- * `RecordedAudio` turn that means: look up the bytes by `upload_key`,
- * sha256 them, and emit `{kind: "recorded", sha256: <hex>}`. Used by
- * `materializeRequestTurns` (one walk per replay creation).
- */
-async function materializeOneTurn(
-	turn: ConversationTurnRequest,
-	audioBytesByKey: ReadonlyMap<string, Uint8Array<ArrayBuffer>>,
-	sha256ByKey: Map<string, string>,
-): Promise<ConversationTurn> {
-	const { audio, ...rest } = turn;
-	if (audio === undefined) return rest;
-	if (audio.kind === "tts") return { ...rest, audio };
-
-	const key = audio.upload_key;
-	const bytes = audioBytesByKey.get(key);
-	if (bytes === undefined) throw new RecordedAudioUploadKeyError(key, "missing");
-
-	const cached = sha256ByKey.get(key);
-	const sha256 = cached ?? (await sha256Hex(bytes));
-	if (cached === undefined) sha256ByKey.set(key, sha256);
-
-	return { ...rest, audio: { kind: "recorded", sha256 } };
-}
+import { TurnsArraySchema } from "./conversations.types.ts";
 
 /** SHA-256 hex (64-char lowercase) of an arbitrary byte buffer. */
 async function sha256Hex(bytes: BufferSource): Promise<string> {
@@ -48,10 +21,31 @@ async function sha256Hex(bytes: BufferSource): Promise<string> {
 	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+export interface PendingAudioWrite {
+	readonly sha256: string;
+	readonly bytes: Uint8Array<ArrayBuffer>;
+}
+
 export interface MaterializeResult {
 	canonicalTurns: ConversationTurn[];
-	/** Map keyed by `upload_key` → sha256 of the uploaded bytes. */
-	audioSha256ByKey: Map<string, string>;
+	/** Content-addressed pairs ready for `saveRecordedConversationAudio`. */
+	audioWrites: PendingAudioWrite[];
+}
+
+function materializeOneTurn(
+	turn: ConversationTurnRequest,
+	sha256ByKey: ReadonlyMap<string, string>,
+): ConversationTurn {
+	const { audio, ...rest } = turn;
+	return match(audio)
+		.with(P.nullish, (): ConversationTurn => rest)
+		.with({ kind: "tts" }, (a): ConversationTurn => ({ ...rest, audio: a }))
+		.with({ kind: "recorded" }, (a): ConversationTurn => {
+			const sha256 = sha256ByKey.get(a.upload_key);
+			if (sha256 === undefined) throw new RecordedAudioUploadKeyError(a.upload_key, "missing");
+			return { ...rest, audio: { kind: "recorded", sha256 } };
+		})
+		.exhaustive();
 }
 
 /**
@@ -59,27 +53,41 @@ export interface MaterializeResult {
  * the canonical/stored form (with `{kind: "recorded", sha256}` substituted
  * in for `{kind: "recorded", upload_key}`).
  *
- * Throws `RecordedAudioUploadKeyMissingError` if a turn references a key
- * that isn't present in the multipart body. Throws
- * `RecordedAudioUploadKeyMismatchError` if the body has extra file parts
- * no turn references — surfaced as a 400 so silent typos don't ghost-upload
- * orphan audio.
+ * Hashing fans out via `Promise.all` so independent WAVs digest in parallel
+ * — sha256 over a multi-MB buffer is the dominant cost on this path.
+ *
+ * Throws `RecordedAudioUploadKeyError` with `reason="missing"` when a turn
+ * references a key absent from the multipart body, or with
+ * `reason="unreferenced"` when the body carries an extra file part no turn
+ * references — surfaced as a 400 so silent typos don't ghost-upload orphan
+ * audio.
  */
 export async function materializeRequestTurns(
 	requestTurns: readonly ConversationTurnRequest[],
 	audioBytesByKey: ReadonlyMap<string, Uint8Array<ArrayBuffer>>,
 ): Promise<MaterializeResult> {
-	const sha256ByKey = new Map<string, string>();
-	const canonicalTurns: ConversationTurn[] = [];
 	const referencedKeys = new Set<string>();
 	for (const turn of requestTurns) {
-		canonicalTurns.push(await materializeOneTurn(turn, audioBytesByKey, sha256ByKey));
 		if (turn.audio?.kind === "recorded") referencedKeys.add(turn.audio.upload_key);
 	}
 	for (const key of audioBytesByKey.keys()) {
 		if (!referencedKeys.has(key)) throw new RecordedAudioUploadKeyError(key, "unreferenced");
 	}
-	return { canonicalTurns, audioSha256ByKey: sha256ByKey };
+	for (const key of referencedKeys) {
+		if (!audioBytesByKey.has(key)) throw new RecordedAudioUploadKeyError(key, "missing");
+	}
+
+	const hashed = await Promise.all(
+		[...audioBytesByKey].map(async ([key, bytes]) => ({
+			key,
+			sha256: await sha256Hex(bytes),
+			bytes,
+		})),
+	);
+	const sha256ByKey = new Map(hashed.map(({ key, sha256 }) => [key, sha256] as const));
+	const canonicalTurns = requestTurns.map((turn) => materializeOneTurn(turn, sha256ByKey));
+	const audioWrites: PendingAudioWrite[] = hashed.map(({ sha256, bytes }) => ({ sha256, bytes }));
+	return { canonicalTurns, audioWrites };
 }
 
 /**
@@ -95,6 +103,13 @@ export async function canonicalizeAndHashTurns(
 	return { json, hash };
 }
 
+export interface EnsureConversationInput {
+	hash: string;
+	name: string;
+	turnsJson: string;
+	now: string;
+}
+
 /**
  * Idempotent upsert of a Conversation row keyed by `hash`. On first POST
  * inserts; on subsequent POSTs with the same hash, updates `name`
@@ -107,10 +122,7 @@ export async function canonicalizeAndHashTurns(
  */
 export function ensureConversation(
 	db: StoreDbOrTx,
-	hash: string,
-	name: string,
-	turnsJson: string,
-	now: string,
+	{ hash, name, turnsJson, now }: EnsureConversationInput,
 ): ConversationRow {
 	const existing = db.select().from(conversations).where(eq(conversations.hash, hash)).get();
 	if (existing !== undefined) {
@@ -134,8 +146,6 @@ export function ensureConversation(
 function parseStoredTurns(raw: string, hash: string): ConversationTurn[] {
 	// Stored rows were validated on the way in; a corrupt row (botched
 	// migration, fsck'd file) shouldn't 500 the entire conversation handler.
-	// Log loudly though — without this, the only signal an operator gets is
-	// an empty `turns` array and "the inspector shows a 0-turn conversation".
 	let parsedJson: unknown;
 	try {
 		parsedJson = JSON.parse(raw);
@@ -147,7 +157,7 @@ function parseStoredTurns(raw: string, hash: string): ConversationTurn[] {
 		);
 		return [];
 	}
-	const result = v.safeParse(TurnArraySchema, parsedJson);
+	const result = v.safeParse(TurnsArraySchema, parsedJson);
 	if (!result.success) {
 		console.warn(
 			"[conversations] turns_json schema validation failed for hash=%s; returning empty turns. issues=%s",
@@ -172,7 +182,15 @@ export function toConversationResponse(row: ConversationRow): ConversationRespon
 
 /** List all conversations, newest-active first. One row per hash. */
 export function listConversations(store: Store): ConversationSummary[] {
-	const rows = store.db.select().from(conversations).all();
+	const rows = store.db
+		.select({
+			hash: conversations.hash,
+			name: conversations.name,
+			createdAt: conversations.createdAt,
+			lastRunAt: conversations.lastRunAt,
+		})
+		.from(conversations)
+		.all();
 	const replayCountRows = store.db
 		.select({ conversationHash: replays.conversationHash, n: count() })
 		.from(replays)

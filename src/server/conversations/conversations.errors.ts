@@ -35,6 +35,26 @@ export class MalformedConversationBodyError extends ConversationError {
 	}
 }
 
+const MISSING_SPEC_PART_ISSUES: readonly BaseIssue<unknown>[] = Object.freeze([
+	{
+		kind: "schema",
+		type: "multipart_part",
+		input: undefined,
+		expected: "form part named `spec` carrying the conversation JSON",
+		received: "absent",
+		message: "Multipart body is missing the `spec` part",
+	},
+]);
+
+/** Multipart `POST /v1/conversations` body had no string `spec` part. */
+export class MissingSpecPartError extends MalformedConversationBodyError {
+	override readonly issues: readonly BaseIssue<unknown>[] = MISSING_SPEC_PART_ISSUES;
+	constructor() {
+		super();
+		this.name = "MissingSpecPartError";
+	}
+}
+
 export class ConversationBodyTooLargeError extends ConversationError {
 	readonly maxBytes: number;
 	constructor(maxBytes: number) {

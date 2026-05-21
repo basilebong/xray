@@ -95,7 +95,7 @@ export type CreateConversationRequest = v.InferOutput<typeof CreateConversationR
 
 const RecordedAudioRefSchema = v.object({
 	kind: v.literal("recorded"),
-	sha256: v.pipe(v.string(), v.regex(HEX_SHA256_RE, "Must be a 64-char lowercase hex SHA-256")),
+	sha256: ConversationHashSchema,
 });
 
 const TurnAudioRefSchema = v.variant("kind", [RecordedAudioRefSchema, TtsAudioRefSchema]);

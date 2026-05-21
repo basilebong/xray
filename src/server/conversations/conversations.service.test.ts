@@ -26,13 +26,12 @@ describe("ensureConversation", () => {
 		const store = makeTempStore();
 		const turns = makeTurns();
 		const hash = await hashOf(turns);
-		const row = ensureConversation(
-			store.db,
+		const row = ensureConversation(store.db, {
 			hash,
-			"My conversation",
-			await canonicalize(turns),
-			"2026-05-18T12:00:00.000Z",
-		);
+			name: "My conversation",
+			turnsJson: await canonicalize(turns),
+			now: "2026-05-18T12:00:00.000Z",
+		});
 		expect(row.hash).toBe(hash);
 		expect(row.name).toBe("My conversation");
 		expect(row.createdAt).toBe("2026-05-18T12:00:00.000Z");
@@ -44,20 +43,18 @@ describe("ensureConversation", () => {
 		const store = makeTempStore();
 		const turns = makeTurns();
 		const hash = await hashOf(turns);
-		ensureConversation(
-			store.db,
+		ensureConversation(store.db, {
 			hash,
-			"First",
-			await canonicalize(turns),
-			"2026-05-18T12:00:00.000Z",
-		);
-		const second = ensureConversation(
-			store.db,
+			name: "First",
+			turnsJson: await canonicalize(turns),
+			now: "2026-05-18T12:00:00.000Z",
+		});
+		const second = ensureConversation(store.db, {
 			hash,
-			"Second",
-			await canonicalize(turns),
-			"2026-05-19T12:00:00.000Z",
-		);
+			name: "Second",
+			turnsJson: await canonicalize(turns),
+			now: "2026-05-19T12:00:00.000Z",
+		});
 		expect(second.name).toBe("Second");
 		const row = getConversationByHash(store, hash);
 		expect(row?.name).toBe("Second");
@@ -85,20 +82,18 @@ describe("listConversations", () => {
 		});
 		const hashA = await hashOf(turnsA);
 		const hashB = await hashOf(turnsB);
-		ensureConversation(
-			store.db,
-			hashA,
-			"A",
-			await canonicalize(turnsA),
-			"2026-05-10T00:00:00.000Z",
-		);
-		ensureConversation(
-			store.db,
-			hashB,
-			"B",
-			await canonicalize(turnsB),
-			"2026-05-12T00:00:00.000Z",
-		);
+		ensureConversation(store.db, {
+			hash: hashA,
+			name: "A",
+			turnsJson: await canonicalize(turnsA),
+			now: "2026-05-10T00:00:00.000Z",
+		});
+		ensureConversation(store.db, {
+			hash: hashB,
+			name: "B",
+			turnsJson: await canonicalize(turnsB),
+			now: "2026-05-12T00:00:00.000Z",
+		});
 		const summaries = listConversations(store);
 		expect(summaries.map((s) => s.name)).toEqual(["B", "A"]);
 		expect(summaries.every((s) => s.replays === 0)).toBe(true);
@@ -111,13 +106,12 @@ describe("toConversationResponse", () => {
 		const store = makeTempStore();
 		const turns = makeTurns();
 		const hash = await hashOf(turns);
-		const row = ensureConversation(
-			store.db,
+		const row = ensureConversation(store.db, {
 			hash,
-			"My conversation",
-			await canonicalize(turns),
-			"2026-05-18T12:00:00.000Z",
-		);
+			name: "My conversation",
+			turnsJson: await canonicalize(turns),
+			now: "2026-05-18T12:00:00.000Z",
+		});
 		const response = toConversationResponse(row);
 		expect(response.turns).toEqual(turns);
 		expect(response.name).toBe("My conversation");
@@ -219,17 +213,19 @@ describe("materializeRequestTurns", () => {
 	it("substitutes audio bytes sha256 into the canonical RecordedAudio turn", async () => {
 		const bytes = new Uint8Array([1, 2, 3, 4, 5]);
 		const map = new Map<string, Uint8Array<ArrayBuffer>>([["audio_0", bytes]]);
-		const { canonicalTurns, audioSha256ByKey } = await materializeRequestTurns(
+		const { canonicalTurns, audioWrites } = await materializeRequestTurns(
 			[
 				{ role: "user", text: "hi", audio: { kind: "recorded", upload_key: "audio_0" } },
 				{ role: "agent" },
 			],
 			map,
 		);
-		const sha = audioSha256ByKey.get("audio_0");
+		expect(audioWrites).toHaveLength(1);
+		const sha = audioWrites[0]?.sha256 ?? "";
 		expect(sha).toHaveLength(64);
+		expect(audioWrites[0]?.bytes).toBe(bytes);
 		const userTurn = canonicalTurns[0];
-		expect(userTurn?.audio).toEqual({ kind: "recorded", sha256: sha ?? "" });
+		expect(userTurn?.audio).toEqual({ kind: "recorded", sha256: sha });
 	});
 
 	it("throws if a RecordedAudio turn references an upload_key with no matching bytes", async () => {

@@ -32,7 +32,7 @@ from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, TypeAlias, TypedDict
+from typing import Literal, TypeAlias, TypedDict, TypeVar
 
 import httpx
 from opentelemetry import context as otel_context
@@ -165,17 +165,13 @@ async def run(
                 *audio_files,
             ]
             r = await client.post("/v1/conversations", files=files)
-            try:
-                r.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                # Failure before the replay row exists — no PATCH path to surface
-                # `failure_reason` through. Wrap in a typed XrayError so the dev
-                # sees an SDK contract violation, not a raw httpx exception.
-                raise XrayServerError(
-                    f"POST /v1/conversations failed: {e.response.status_code} {e.response.text[:500]}",
-                    status_code=e.response.status_code,
-                ) from e
-        conversation_upsert = _read_conversation_upsert_response(r.json())
+            # Failure before the replay row exists — no PATCH path to surface
+            # `failure_reason` through. Wrap in a typed XrayError so the dev
+            # sees an SDK contract violation, not a raw httpx exception.
+            _raise_for_status_typed(r, "POST /v1/conversations")
+        conversation_upsert = _read_response(
+            r.json(), _ConversationUpsertResponse, "POST /v1/conversations"
+        )
         conversation_hash = conversation_upsert.hash
 
         # 2. Create Replay eagerly so the runtime can propagate the id.
@@ -183,14 +179,8 @@ async def run(
         if run_config is not None:
             create_body["run_config"] = run_config.to_wire()
         r = await client.post("/v1/replays", json=create_body)
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise XrayServerError(
-                f"POST /v1/replays failed: {e.response.status_code} {e.response.text[:500]}",
-                status_code=e.response.status_code,
-            ) from e
-        replay_create = _read_replay_create_response(r.json())
+        _raise_for_status_typed(r, "POST /v1/replays")
+        replay_create = _read_response(r.json(), _ReplayCreateResponse, "POST /v1/replays")
         replay_id = replay_create.id
 
         # 2. Bind runtime.
@@ -358,18 +348,27 @@ async def run(
 # ─── Helpers ──────────────────────────────────────────────────────────
 
 
-def _read_replay_create_response(raw: object) -> _ReplayCreateResponse:
-    try:
-        return _ReplayCreateResponse.model_validate(raw)
-    except ValidationError as e:
-        raise XrayError(f"POST /v1/replays response malformed: {e}") from e
+_TResponse = TypeVar("_TResponse", bound=BaseModel)
 
 
-def _read_conversation_upsert_response(raw: object) -> _ConversationUpsertResponse:
+def _read_response(raw: object, model_cls: type[_TResponse], endpoint: str) -> _TResponse:
     try:
-        return _ConversationUpsertResponse.model_validate(raw)
+        return model_cls.model_validate(raw)
     except ValidationError as e:
-        raise XrayError(f"POST /v1/conversations response malformed: {e}") from e
+        raise XrayError(f"{endpoint} response malformed: {e}") from e
+
+
+def _raise_for_status_typed(response: httpx.Response, endpoint: str) -> None:
+    """Wrap ``response.raise_for_status()``'s ``HTTPStatusError`` into a typed
+    ``XrayServerError`` so the dev sees an SDK contract violation rather than a
+    raw httpx exception. No-op on success."""
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise XrayServerError(
+            f"{endpoint} failed: {e.response.status_code} {e.response.text[:500]}",
+            status_code=e.response.status_code,
+        ) from e
 
 
 async def _evaluate_judge(judge: JudgePredicate, replay_result: ReplayResult) -> object:

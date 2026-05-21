@@ -1,10 +1,7 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
 import { Hono } from "hono";
 import * as v from "valibot";
 
+import { makeTempAudioRoot } from "@/server/audio/audio.test-utils.ts";
 import { readJson } from "@/server/core/test-utils.ts";
 import {
 	createReplayForTest,
@@ -17,9 +14,8 @@ import { describe, expect, it } from "bun:test";
 
 function makeApp() {
 	const store = makeTempStore();
-	const audioRoot = mkdtempSync(join(tmpdir(), "xray-conv-test-"));
+	const { path: audioRoot, dispose } = makeTempAudioRoot();
 	const app = new Hono().route("/v1", createConversationsRouter(store, audioRoot));
-	const dispose = () => rmSync(audioRoot, { recursive: true, force: true });
 	return { app, store, audioRoot, dispose };
 }
 

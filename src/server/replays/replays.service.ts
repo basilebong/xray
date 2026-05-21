@@ -1,5 +1,6 @@
 import { and, desc, eq } from "drizzle-orm";
 
+import { ConversationNotFoundError } from "@/server/conversations/conversations.errors.ts";
 import { getConversationByHash } from "@/server/conversations/conversations.service.ts";
 import type { JobRunner } from "@/server/jobs/jobs.bunqueue.ts";
 import {
@@ -23,7 +24,6 @@ import type {
 } from "@/server/store/types.ts";
 
 import {
-	ConversationHashNotFoundError,
 	ReplayLifecycleTransitionError,
 	ReplayNotFoundError,
 	ReplayNotReadyForAnalysisError,
@@ -54,7 +54,7 @@ export function createReplay(
 	const now = opts.now ?? (() => new Date().toISOString());
 	const conv = getConversationByHash(store, req.conversation_hash);
 	if (conv === undefined) {
-		throw new ConversationHashNotFoundError(req.conversation_hash);
+		throw new ConversationNotFoundError(req.conversation_hash);
 	}
 	const id = opts.id ?? crypto.randomUUID();
 	const startedAt = now();
@@ -71,7 +71,7 @@ export function createReplay(
 		jobId: null,
 	};
 	store.db.insert(replays).values(replayRow).run();
-	return buildReplayDetail(store, id);
+	return buildReplayDetail(store, replayRow);
 }
 
 const TERMINAL_STATES = new Set<ReplayLifecycleState>(["completed", "failed"]);
@@ -107,16 +107,18 @@ export function updateReplay(
 	if (patch.lifecycle_state !== undefined) updates.lifecycleState = patch.lifecycle_state;
 	if (patch.failure_reason !== undefined) updates.failureReason = patch.failure_reason;
 	if (patch.finished_at !== undefined) updates.finishedAt = patch.finished_at;
+	let row: ReplayRow = existing;
 	if (Object.keys(updates).length > 0) {
 		store.db.update(replays).set(updates).where(eq(replays.id, id)).run();
+		row = { ...existing, ...updates };
 	}
-	return buildReplayDetail(store, id);
+	return buildReplayDetail(store, row);
 }
 
 export function getReplay(store: Store, id: string): ReplayDetailResponse {
 	const replayRow = store.db.select().from(replays).where(eq(replays.id, id)).get();
 	if (replayRow === undefined) throw new ReplayNotFoundError(id);
-	return buildReplayDetail(store, id);
+	return buildReplayDetail(store, replayRow);
 }
 
 export function compareReplays(store: Store, ids: readonly string[]): CompareReplaysResponse {
@@ -124,7 +126,7 @@ export function compareReplays(store: Store, ids: readonly string[]): CompareRep
 	for (const id of ids) {
 		const row = store.db.select().from(replays).where(eq(replays.id, id)).get();
 		if (row === undefined) throw new ReplayNotFoundError(id);
-		out.push(buildReplayDetail(store, id));
+		out.push(buildReplayDetail(store, row));
 	}
 	return { replays: out };
 }
@@ -155,9 +157,8 @@ function toSummary(r: ReplayRow): ReplaySummaryResponse {
 	};
 }
 
-function buildReplayDetail(store: Store, id: string): ReplayDetailResponse {
-	const r = store.db.select().from(replays).where(eq(replays.id, id)).get();
-	if (r === undefined) throw new ReplayNotFoundError(id);
+function buildReplayDetail(store: Store, r: ReplayRow): ReplayDetailResponse {
+	const id = r.id;
 	const turns = store.db.select().from(replayTurns).where(eq(replayTurns.replayId, id)).all();
 	turns.sort((a, b) => a.idx - b.idx);
 	const segments = store.db
@@ -340,8 +341,9 @@ export async function enqueueAnalysis(
 		.run();
 
 	const claimed = findReplay(store, id);
-	if (claimed === undefined || claimed.lifecycleState !== "analyzing") {
-		throw new ReplayNotReadyForAnalysisError(id, claimed?.lifecycleState ?? "unknown");
+	if (claimed === undefined) throw new ReplayNotFoundError(id);
+	if (claimed.lifecycleState !== "analyzing") {
+		throw new ReplayNotReadyForAnalysisError(id, claimed.lifecycleState);
 	}
 
 	let jobId: string;

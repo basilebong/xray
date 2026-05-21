@@ -5,6 +5,7 @@ import { describeRoute } from "hono-openapi";
 import { match, P } from "ts-pattern";
 import * as v from "valibot";
 
+import { ConversationNotFoundError } from "@/server/conversations/conversations.errors.ts";
 import {
 	BodyTooLargeResponseSchema,
 	ConversationNotFoundResponseSchema,
@@ -17,7 +18,6 @@ import { sanitizeIssues } from "@/server/sanitize-issues/sanitize-issues.ts";
 import type { Store } from "@/server/store/store.ts";
 
 import {
-	ConversationHashNotFoundError,
 	InvalidCompareSelectionError,
 	InvalidReplayIdError,
 	InvalidReplayRequestError,
@@ -460,7 +460,7 @@ export function createReplaysRouter(
 			.with(P.instanceOf(ReplayBodyTooLargeError), (e) =>
 				c.json({ error: "body_too_large", max_bytes: e.maxBytes }, 413),
 			)
-			.with(P.instanceOf(ConversationHashNotFoundError), (e) =>
+			.with(P.instanceOf(ConversationNotFoundError), (e) =>
 				c.json(
 					{
 						error: "conversation_not_found",

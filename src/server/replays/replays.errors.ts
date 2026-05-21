@@ -1,5 +1,7 @@
 import type { BaseIssue } from "valibot";
 
+import type { ReplayLifecycleState } from "@/server/store/types.ts";
+
 export class ReplayError extends Error {
 	constructor(message: string, options?: ErrorOptions) {
 		super(message, options);
@@ -54,20 +56,6 @@ export class ReplayNotFoundError extends ReplayError {
 }
 
 /**
- * A POST /v1/replays referenced a `conversation_hash` that does not exist.
- * The dev must POST /v1/conversations first (the SDK does this automatically
- * when it calls `xray.run`).
- */
-export class ConversationHashNotFoundError extends ReplayError {
-	readonly conversationHash: string;
-	constructor(conversationHash: string) {
-		super(`Conversation "${conversationHash}" not found`);
-		this.name = "ConversationHashNotFoundError";
-		this.conversationHash = conversationHash;
-	}
-}
-
-/**
  * A PATCH attempted to move the replay out of a terminal lifecycle state.
  * Terminal states (`completed`, `failed`) are write-once. The SDK is the
  * sole writer for non-server-owned transitions and only emits one terminal
@@ -102,8 +90,8 @@ export class ReplayBodyTooLargeError extends ReplayError {
  */
 export class ReplayNotReadyForAnalysisError extends ReplayError {
 	readonly replayId: string;
-	readonly currentState: string;
-	constructor(replayId: string, currentState: string) {
+	readonly currentState: ReplayLifecycleState;
+	constructor(replayId: string, currentState: ReplayLifecycleState) {
 		super(`Replay "${replayId}" is in state "${currentState}", not "recording_uploaded"`);
 		this.name = "ReplayNotReadyForAnalysisError";
 		this.replayId = replayId;

@@ -23,6 +23,7 @@ import {
 	InvalidConversationHashError,
 	InvalidConversationRequestError,
 	MalformedConversationBodyError,
+	MissingSpecPartError,
 	RecordedAudioUploadKeyError,
 } from "./conversations.errors.ts";
 import {
@@ -41,7 +42,6 @@ import {
 	MAX_CONVERSATION_BODY_BYTES,
 } from "./conversations.types.ts";
 
-const MAX_CONVERSATION_SPEC_BYTES = MAX_CONVERSATION_BODY_BYTES;
 const MAX_CONVERSATION_MULTIPART_BYTES = 512 * 1024 * 1024;
 
 export function createConversationsRouter(store: Store, audioRoot: string): Hono {
@@ -106,7 +106,7 @@ export function createConversationsRouter(store: Store, audioRoot: string): Hono
 			const { spec, audioBytesByKey } = await parseMultipartConversationBody(body);
 			const parsed = v.safeParse(CreateConversationRequestSchema, spec);
 			if (!parsed.success) throw new InvalidConversationRequestError(parsed.issues);
-			const { canonicalTurns, audioSha256ByKey } = await materializeRequestTurns(
+			const { canonicalTurns, audioWrites } = await materializeRequestTurns(
 				parsed.output.turns,
 				audioBytesByKey,
 			);
@@ -116,16 +116,18 @@ export function createConversationsRouter(store: Store, audioRoot: string): Hono
 			// (`recorded/<sha256>.wav`) — a partial write followed by a failed
 			// upsert leaves a harmless orphan file the next POST will find.
 			await Promise.all(
-				[...audioSha256ByKey].map(([uploadKey, sha256]) => {
-					const bytes = audioBytesByKey.get(uploadKey);
-					return bytes === undefined
-						? Promise.resolve(undefined)
-						: saveRecordedConversationAudio(audioRoot, sha256, bytes);
-				}),
+				audioWrites.map(({ sha256, bytes }) =>
+					saveRecordedConversationAudio(audioRoot, sha256, bytes),
+				),
 			);
 
 			const now = new Date().toISOString();
-			const row = ensureConversation(store.db, hash, parsed.output.name, turnsJson, now);
+			const row = ensureConversation(store.db, {
+				hash,
+				name: parsed.output.name,
+				turnsJson,
+				now,
+			});
 			return c.json(toConversationResponse(row));
 		},
 	);
@@ -261,7 +263,10 @@ export function createConversationsRouter(store: Store, audioRoot: string): Hono
 			.with(P.instanceOf(RecordedAudioUploadKeyError), (e) =>
 				c.json(
 					{
-						error: `recorded_audio_upload_key_${e.reason}` as const,
+						error: match(e.reason)
+							.with("missing", () => "recorded_audio_upload_key_missing" as const)
+							.with("unreferenced", () => "recorded_audio_upload_key_unreferenced" as const)
+							.exhaustive(),
 						upload_key: e.uploadKey,
 					},
 					400,
@@ -313,13 +318,9 @@ async function parseMultipartConversationBody(
 		}
 		audioBytesByKey.set(key, new Uint8Array(await value.arrayBuffer()));
 	}
-	if (specEntry === undefined) {
-		throw new MalformedConversationBodyError({
-			cause: new Error("multipart body missing string `spec` part"),
-		});
-	}
-	if (specEntry.length > MAX_CONVERSATION_SPEC_BYTES) {
-		throw new ConversationBodyTooLargeError(MAX_CONVERSATION_SPEC_BYTES);
+	if (specEntry === undefined) throw new MissingSpecPartError();
+	if (specEntry.length > MAX_CONVERSATION_BODY_BYTES) {
+		throw new ConversationBodyTooLargeError(MAX_CONVERSATION_BODY_BYTES);
 	}
 	try {
 		return { spec: JSON.parse(specEntry), audioBytesByKey };

@@ -1,12 +1,12 @@
 import { eq } from "drizzle-orm";
 
+import { ConversationNotFoundError } from "@/server/conversations/conversations.errors.ts";
 import { seedConversation } from "@/server/conversations/conversations.test-utils.ts";
 import { makeFakeJobRunner } from "@/server/jobs/jobs.test-utils.ts";
 import { replays } from "@/server/store/schema.ts";
 import { makeTempStore } from "@/server/store/test-utils.ts";
 
 import {
-	ConversationHashNotFoundError,
 	ReplayLifecycleTransitionError,
 	ReplayNotFoundError,
 	ReplayNotReadyForAnalysisError,
@@ -45,7 +45,7 @@ describe("createReplay", () => {
 	it("rejects unknown conversation_hash", () => {
 		const store = makeTempStore();
 		expect(() => createReplay(store, { conversation_hash: "f".repeat(64) })).toThrow(
-			ConversationHashNotFoundError,
+			ConversationNotFoundError,
 		);
 		store.close();
 	});

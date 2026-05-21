@@ -1,7 +1,6 @@
-import { canonicalizeAndHashTurns } from "@/server/conversations/conversations.service.ts";
-import { makeTurns } from "@/server/conversations/conversations.test-utils.ts";
+import { makeTurns, seedConversation } from "@/server/conversations/conversations.test-utils.ts";
 import type { ConversationTurn } from "@/server/conversations/conversations.types.ts";
-import { conversations, replays } from "@/server/store/schema.ts";
+import { replays } from "@/server/store/schema.ts";
 import type { Store } from "@/server/store/store.ts";
 
 import { createReplay } from "./replays.service.ts";
@@ -51,18 +50,7 @@ export async function createReplayForTest(
 	req: CreateReplayTestOverrides | ReturnType<typeof makeCreateReplayRequest> = {},
 ): Promise<ReplayDetailResponse> {
 	const filled = isAlreadyFilled(req) ? req : makeCreateReplayRequest(req);
-	const { json: turnsJson, hash } = await canonicalizeAndHashTurns(filled.turns);
-	store.db
-		.insert(conversations)
-		.values({
-			hash,
-			name: filled.name,
-			turnsJson,
-			createdAt: "2026-05-18T11:00:00.000Z",
-			lastRunAt: null,
-		})
-		.onConflictDoNothing()
-		.run();
+	const { hash } = await seedConversation(store, { name: filled.name, turns: filled.turns });
 	return createReplay(store, {
 		conversation_hash: hash,
 		...(filled.run_config !== undefined ? { run_config: filled.run_config } : {}),
@@ -105,20 +93,13 @@ export async function seedReplay(
 	if (overrides.turns !== undefined) turnsOpts.turns = overrides.turns;
 	const turns = makeTurns(turnsOpts);
 	const name = overrides.name ?? `Conversation ${counter}`;
-	const { json: turnsJson, hash } = await canonicalizeAndHashTurns(turns);
-	const conversationHash = overrides.conversationHash ?? hash;
+	const { hash: derivedHash } = await seedConversation(store, {
+		name,
+		turns,
+		lastRunAt: "2026-05-18T12:00:00.000Z",
+	});
+	const conversationHash = overrides.conversationHash ?? derivedHash;
 	const id = overrides.id ?? `00000000-0000-0000-0000-${String(counter).padStart(12, "0")}`;
-	store.db
-		.insert(conversations)
-		.values({
-			hash: conversationHash,
-			name,
-			turnsJson,
-			createdAt: "2026-05-18T11:00:00.000Z",
-			lastRunAt: "2026-05-18T12:00:00.000Z",
-		})
-		.onConflictDoNothing()
-		.run();
 	store.db
 		.insert(replays)
 		.values({
