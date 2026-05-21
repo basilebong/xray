@@ -77,6 +77,20 @@ export const TurnsRequestArraySchema = v.pipe(
 	v.maxLength(MAX_TURNS_PER_CONVERSATION),
 );
 
+/**
+ * JSON `spec` part of `POST /v1/conversations` (multipart/form-data).
+ * Carries the dev-facing display label + the turn array (in request form);
+ * `RecordedAudio` turns reference multipart file parts by `upload_key`.
+ * Server reads each audio file part, sha256s the bytes, stores a
+ * content-addressed copy, substitutes the sha256 into the canonical form,
+ * then hashes the canonical turn JSON to produce the conversation hash.
+ */
+export const CreateConversationRequestSchema = v.object({
+	name: ConversationNameSchema,
+	turns: TurnsRequestArraySchema,
+});
+export type CreateConversationRequest = v.InferOutput<typeof CreateConversationRequestSchema>;
+
 // ─── Canonical-form schemas (what's hashed, stored, and returned) ─────
 
 const RecordedAudioRefSchema = v.object({

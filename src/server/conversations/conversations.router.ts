@@ -1,9 +1,13 @@
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { describeRoute } from "hono-openapi";
 import { match, P } from "ts-pattern";
 import * as v from "valibot";
 
+import { saveRecordedConversationAudio } from "@/server/audio/audio.service.ts";
+import { MAX_AUDIO_BYTES } from "@/server/audio/audio.types.ts";
 import {
+	BodyTooLargeResponseSchema,
 	ConversationNotFoundResponseSchema,
 	openApiSchemaFromValibot,
 	ValidationErrorResponseSchema,
@@ -13,20 +17,118 @@ import { ListReplaysResponseSchema } from "@/server/replays/replays.types.ts";
 import { sanitizeIssues } from "@/server/sanitize-issues/sanitize-issues.ts";
 import type { Store } from "@/server/store/store.ts";
 
-import { ConversationNotFoundError, InvalidConversationHashError } from "./conversations.errors.ts";
 import {
+	ConversationBodyTooLargeError,
+	ConversationNotFoundError,
+	InvalidConversationHashError,
+	InvalidConversationRequestError,
+	MalformedConversationBodyError,
+	RecordedAudioUploadKeyError,
+} from "./conversations.errors.ts";
+import {
+	canonicalizeAndHashTurns,
+	ensureConversation,
 	getConversationByHash,
 	listConversations,
+	materializeRequestTurns,
 	toConversationResponse,
 } from "./conversations.service.ts";
 import {
 	ConversationHashSchema,
 	ConversationResponseSchema,
+	CreateConversationRequestSchema,
 	ListConversationsResponseSchema,
+	MAX_CONVERSATION_BODY_BYTES,
 } from "./conversations.types.ts";
 
-export function createConversationsRouter(store: Store): Hono {
+const MAX_CONVERSATION_SPEC_BYTES = MAX_CONVERSATION_BODY_BYTES;
+const MAX_CONVERSATION_MULTIPART_BYTES = 512 * 1024 * 1024;
+
+export function createConversationsRouter(store: Store, audioRoot: string): Hono {
 	const router = new Hono();
+
+	router.post(
+		"/conversations",
+		describeRoute({
+			tags: ["Conversations"],
+			summary: "Upsert a Conversation",
+			description:
+				"Multipart/form-data: a `spec` JSON part with `name` + `turns`, and one named file part per `RecordedAudio` turn. The server reads each audio part, sha256s the bytes, stores a content-addressed copy, computes the conversation hash from the canonical turn JSON (with sha256 substituted in), and upserts the conversation row by hash (last-write-wins on `name`). Returns the canonical row.",
+			requestBody: {
+				required: true,
+				content: {
+					"multipart/form-data": {
+						schema: {
+							type: "object",
+							required: ["spec"],
+							properties: {
+								spec: openApiSchemaFromValibot(CreateConversationRequestSchema),
+							},
+							additionalProperties: { type: "string", format: "binary" },
+						},
+					},
+				},
+			},
+			responses: {
+				"200": {
+					description: "Conversation upserted; canonical row returned.",
+					content: {
+						"application/json": { schema: openApiSchemaFromValibot(ConversationResponseSchema) },
+					},
+				},
+				"400": {
+					description: "Body failed validation or referenced upload_key is missing.",
+					content: {
+						"application/json": { schema: openApiSchemaFromValibot(ValidationErrorResponseSchema) },
+					},
+				},
+				"413": {
+					description: "Body exceeded byte cap.",
+					content: {
+						"application/json": { schema: openApiSchemaFromValibot(BodyTooLargeResponseSchema) },
+					},
+				},
+			},
+		}),
+		bodyLimit({
+			maxSize: MAX_CONVERSATION_MULTIPART_BYTES,
+			onError: () => {
+				throw new ConversationBodyTooLargeError(MAX_CONVERSATION_MULTIPART_BYTES);
+			},
+		}),
+		async (c) => {
+			let body: Record<string, string | File>;
+			try {
+				body = await c.req.parseBody({ all: false });
+			} catch (cause) {
+				throw new MalformedConversationBodyError({ cause });
+			}
+			const { spec, audioBytesByKey } = await parseMultipartConversationBody(body);
+			const parsed = v.safeParse(CreateConversationRequestSchema, spec);
+			if (!parsed.success) throw new InvalidConversationRequestError(parsed.issues);
+			const { canonicalTurns, audioSha256ByKey } = await materializeRequestTurns(
+				parsed.output.turns,
+				audioBytesByKey,
+			);
+			const { json: turnsJson, hash } = await canonicalizeAndHashTurns(canonicalTurns);
+
+			// Write audio files BEFORE the upsert. Content-addressed
+			// (`recorded/<sha256>.wav`) — a partial write followed by a failed
+			// upsert leaves a harmless orphan file the next POST will find.
+			await Promise.all(
+				[...audioSha256ByKey].map(([uploadKey, sha256]) => {
+					const bytes = audioBytesByKey.get(uploadKey);
+					return bytes === undefined
+						? Promise.resolve(undefined)
+						: saveRecordedConversationAudio(audioRoot, sha256, bytes);
+				}),
+			);
+
+			const now = new Date().toISOString();
+			const row = ensureConversation(store.db, hash, parsed.output.name, turnsJson, now);
+			return c.json(toConversationResponse(row));
+		},
+	);
 
 	router.get(
 		"/conversations",
@@ -148,6 +250,26 @@ export function createConversationsRouter(store: Store): Hono {
 			.with(P.instanceOf(InvalidConversationHashError), (e) =>
 				c.json({ error: "invalid_conversation_hash", issues: sanitizeIssues(e.issues) }, 400),
 			)
+			.with(
+				P.union(
+					P.instanceOf(InvalidConversationRequestError),
+					P.instanceOf(MalformedConversationBodyError),
+				),
+				(e) =>
+					c.json({ error: "invalid_conversation_request", issues: sanitizeIssues(e.issues) }, 400),
+			)
+			.with(P.instanceOf(RecordedAudioUploadKeyError), (e) =>
+				c.json(
+					{
+						error: `recorded_audio_upload_key_${e.reason}` as const,
+						upload_key: e.uploadKey,
+					},
+					400,
+				),
+			)
+			.with(P.instanceOf(ConversationBodyTooLargeError), (e) =>
+				c.json({ error: "body_too_large", max_bytes: e.maxBytes }, 413),
+			)
 			.with(P.instanceOf(ConversationNotFoundError), (e) =>
 				c.json(
 					{
@@ -173,4 +295,35 @@ function parseConversationHash(raw: string): string {
 	const check = v.safeParse(ConversationHashSchema, raw);
 	if (!check.success) throw new InvalidConversationHashError(check.issues);
 	return check.output;
+}
+
+async function parseMultipartConversationBody(
+	body: Record<string, string | File>,
+): Promise<{ spec: unknown; audioBytesByKey: Map<string, Uint8Array<ArrayBuffer>> }> {
+	let specEntry: string | undefined;
+	const audioBytesByKey = new Map<string, Uint8Array<ArrayBuffer>>();
+	for (const [key, value] of Object.entries(body)) {
+		if (key === "spec") {
+			if (typeof value === "string") specEntry = value;
+			continue;
+		}
+		if (typeof value === "string") continue;
+		if (value.size > MAX_AUDIO_BYTES) {
+			throw new ConversationBodyTooLargeError(MAX_AUDIO_BYTES);
+		}
+		audioBytesByKey.set(key, new Uint8Array(await value.arrayBuffer()));
+	}
+	if (specEntry === undefined) {
+		throw new MalformedConversationBodyError({
+			cause: new Error("multipart body missing string `spec` part"),
+		});
+	}
+	if (specEntry.length > MAX_CONVERSATION_SPEC_BYTES) {
+		throw new ConversationBodyTooLargeError(MAX_CONVERSATION_SPEC_BYTES);
+	}
+	try {
+		return { spec: JSON.parse(specEntry), audioBytesByKey };
+	} catch (cause) {
+		throw new MalformedConversationBodyError({ cause });
+	}
 }

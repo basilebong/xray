@@ -20,8 +20,6 @@ from typing import Literal, TypeAlias, TypedDict
 
 from typing_extensions import NotRequired, assert_never
 
-from ._json import JsonObject
-
 Role: TypeAlias = Literal["user", "agent"]
 AssertionStatus: TypeAlias = Literal["passed", "failed", "errored"]
 
@@ -124,27 +122,18 @@ class Conversation:
         if len(self.turns) == 0:
             raise ValueError("Conversation must have at least one turn")
 
-    def to_replay_spec_payload(
-        self,
-        *,
-        modality: Literal["voice"] = "voice",
-        run_config: JsonObject | None = None,
-    ) -> ReplaySpecBody:
-        """JSON ``spec`` part of the multipart POST to ``/v1/replays``.
+    def to_conversation_spec_payload(self) -> ConversationSpecBody:
+        """JSON ``spec`` part of the multipart POST to ``/v1/conversations``.
 
         Recorded-audio turns are emitted as ``{kind: "recorded",
         upload_key: f"audio_<idx>"}`` so the server can match each turn
         to the corresponding multipart file part. The orchestrator builds
         the matching file-part dict from :func:`recorded_audio_uploads`.
         """
-        body: ReplaySpecBody = {
+        return {
             "name": self.name,
             "turns": [_turn_to_wire(t, idx) for idx, t in enumerate(self.turns)],
-            "modality": modality,
         }
-        if run_config is not None:
-            body["run_config"] = run_config
-        return body
 
     def recorded_audio_uploads(self) -> list[tuple[str, str]]:
         """Pairs of (upload_key, file_path) for each RecordedAudio turn.
@@ -187,11 +176,9 @@ class TurnWirePayload(TypedDict):
     audio: NotRequired[AudioWirePayload]
 
 
-class ReplaySpecBody(TypedDict):
+class ConversationSpecBody(TypedDict):
     name: str
     turns: list[TurnWirePayload]
-    modality: Literal["voice"]
-    run_config: NotRequired[JsonObject]
 
 
 # ─── Wire encoders ────────────────────────────────────────────────────
@@ -310,9 +297,9 @@ __all__ = [
     "JudgePredicate",
     "ModelUsage",
     "RecordedAudio",
+    "ConversationSpecBody",
     "RecordedAudioWirePayload",
     "ReplayResult",
-    "ReplaySpecBody",
     "Role",
     "StageTimings",
     "ToolCall",

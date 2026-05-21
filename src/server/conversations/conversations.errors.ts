@@ -7,6 +7,43 @@ export class ConversationError extends Error {
 	}
 }
 
+const MALFORMED_BODY_ISSUES: readonly BaseIssue<unknown>[] = Object.freeze([
+	{
+		kind: "schema",
+		type: "json_body",
+		input: undefined,
+		expected: "valid JSON",
+		received: "unparseable text",
+		message: "Request body must be valid JSON",
+	},
+]);
+
+export class InvalidConversationRequestError extends ConversationError {
+	readonly issues: readonly BaseIssue<unknown>[];
+	constructor(issues: readonly BaseIssue<unknown>[]) {
+		super("Invalid conversation request body");
+		this.name = "InvalidConversationRequestError";
+		this.issues = issues;
+	}
+}
+
+export class MalformedConversationBodyError extends ConversationError {
+	readonly issues: readonly BaseIssue<unknown>[] = MALFORMED_BODY_ISSUES;
+	constructor(options?: ErrorOptions) {
+		super("Request body must be valid JSON", options);
+		this.name = "MalformedConversationBodyError";
+	}
+}
+
+export class ConversationBodyTooLargeError extends ConversationError {
+	readonly maxBytes: number;
+	constructor(maxBytes: number) {
+		super(`Body exceeds ${maxBytes} bytes`);
+		this.name = "ConversationBodyTooLargeError";
+		this.maxBytes = maxBytes;
+	}
+}
+
 /** Path-param conversation hash failed validation. */
 export class InvalidConversationHashError extends ConversationError {
 	readonly issues: readonly BaseIssue<unknown>[];

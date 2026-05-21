@@ -23,9 +23,8 @@ def test_replay_spec_payload_matches_wire_shape():
         name="My conv",
         turns=[Turn.user("hi there", key="u0"), Turn.agent(key="a0")],
     )
-    payload = c.to_replay_spec_payload()
+    payload = c.to_conversation_spec_payload()
     assert payload["name"] == "My conv"
-    assert payload["modality"] == "voice"
     assert payload["turns"] == [
         {"role": "user", "text": "hi there", "key": "u0"},
         {"role": "agent", "key": "a0"},
@@ -46,7 +45,7 @@ def test_replay_spec_payload_marks_recorded_audio_with_upload_key(tmp_path: Path
             Turn.agent(key="a0"),
         ],
     )
-    payload = c.to_replay_spec_payload()
+    payload = c.to_conversation_spec_payload()
     audio = payload["turns"][0].get("audio")
     assert audio == {"kind": "recorded", "upload_key": "audio_0"}
 
@@ -56,7 +55,7 @@ def test_replay_spec_payload_tts_audio_inline(tmp_path: Path):
         name="x",
         turns=[Turn.user("hi", key="u0", audio=TtsAudio(voice_id="alloy"))],
     )
-    payload = c.to_replay_spec_payload()
+    payload = c.to_conversation_spec_payload()
     assert payload["turns"][0].get("audio") == {"kind": "tts", "voice_id": "alloy"}
 
 

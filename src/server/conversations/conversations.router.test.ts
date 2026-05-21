@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { Hono } from "hono";
 import * as v from "valibot";
 
@@ -13,8 +17,10 @@ import { describe, expect, it } from "bun:test";
 
 function makeApp() {
 	const store = makeTempStore();
-	const app = new Hono().route("/v1", createConversationsRouter(store));
-	return { app, store };
+	const audioRoot = mkdtempSync(join(tmpdir(), "xray-conv-test-"));
+	const app = new Hono().route("/v1", createConversationsRouter(store, audioRoot));
+	const dispose = () => rmSync(audioRoot, { recursive: true, force: true });
+	return { app, store, audioRoot, dispose };
 }
 
 describe("GET /v1/conversations", () => {
