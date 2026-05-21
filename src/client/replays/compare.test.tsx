@@ -14,11 +14,10 @@ afterEach(() => cleanup());
 interface ReplayTurn {
 	idx: number;
 	role: "user" | "agent";
-	key: string | null;
-	started_at: string | null;
-	ended_at: string | null;
-	transcript: string | null;
-	audio_path: string | null;
+	turn_start_ms: number;
+	turn_end_ms: number;
+	voice_start_ms: number;
+	voice_end_ms: number;
 }
 
 function buildReplay(
@@ -28,17 +27,16 @@ function buildReplay(
 ): {
 	id: string;
 	conversation_hash: string;
-	status: "completed";
+	lifecycle_state: "completed";
+	analysis_step: null;
 	failure_reason: null;
-	modality: "voice";
 	started_at: string;
 	finished_at: string;
 	audio_path: null;
-	transcript: null;
+	job_id: null;
 	run_config: unknown;
-	judge: { status: null; score: null; reason: null; error: null };
 	turns: ReplayTurn[];
-	assertions: never[];
+	speech_segments: never[];
 	tool_calls: never[];
 	model_usage: never[];
 	spans: never[];
@@ -46,72 +44,32 @@ function buildReplay(
 	return {
 		id,
 		conversation_hash: "a".repeat(64),
-		status: "completed",
+		lifecycle_state: "completed",
+		analysis_step: null,
 		failure_reason: null,
-		modality: "voice",
 		started_at: "2026-05-15T10:00:00.000Z",
 		finished_at: "2026-05-15T10:00:30.000Z",
 		audio_path: null,
-		transcript: null,
+		job_id: null,
 		run_config,
-		judge: { status: null, score: null, reason: null, error: null },
 		turns,
-		assertions: [],
+		speech_segments: [],
 		tool_calls: [],
 		model_usage: [],
 		spans: [],
 	};
 }
 
+const TURN_FIXTURE: ReplayTurn = {
+	idx: 0,
+	role: "user",
+	turn_start_ms: 0,
+	turn_end_ms: 2500,
+	voice_start_ms: 100,
+	voice_end_ms: 2400,
+};
+
 describe("CompareReplays route", () => {
-	it("renders 'no matching turn' placeholder when one replay is missing a key", async () => {
-		const replayA = buildReplay("11111111-1111-1111-1111-111111111111", [
-			{
-				idx: 0,
-				role: "user",
-				key: "greet",
-				started_at: null,
-				ended_at: null,
-				transcript: "hi",
-				audio_path: null,
-			},
-			{
-				idx: 1,
-				role: "agent",
-				key: "only-a",
-				started_at: null,
-				ended_at: null,
-				transcript: "alone",
-				audio_path: null,
-			},
-		]);
-		const replayB = buildReplay("22222222-2222-2222-2222-222222222222", [
-			{
-				idx: 0,
-				role: "user",
-				key: "greet",
-				started_at: null,
-				ended_at: null,
-				transcript: "yo",
-				audio_path: null,
-			},
-		]);
-		server.use(
-			http.post("http://localhost/v1/replays/compare", () =>
-				HttpResponse.json({ replays: [replayA, replayB] }),
-			),
-		);
-
-		const { ui } = renderWithRouter({
-			initialEntries: [
-				"/compare/replays?ids=11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222",
-			],
-		});
-		render(ui);
-
-		await waitFor(() => expect(screen.getAllByText(/no matching turn/i).length).toBeGreaterThan(0));
-	});
-
 	it("rejects fewer than 2 replay ids in the query", async () => {
 		const { ui } = renderWithRouter({
 			initialEntries: ["/compare/replays?ids=11111111-1111-1111-1111-111111111111"],
@@ -135,36 +93,14 @@ describe("CompareReplays route", () => {
 	});
 
 	it("highlights only the run_config keys that differ between replays", async () => {
-		const replayA = buildReplay(
-			"11111111-1111-1111-1111-111111111111",
-			[
-				{
-					idx: 0,
-					role: "user",
-					key: "greet",
-					started_at: null,
-					ended_at: null,
-					transcript: "hi",
-					audio_path: null,
-				},
-			],
-			{ model: "gpt-4", temperature: 0.2 },
-		);
-		const replayB = buildReplay(
-			"22222222-2222-2222-2222-222222222222",
-			[
-				{
-					idx: 0,
-					role: "user",
-					key: "greet",
-					started_at: null,
-					ended_at: null,
-					transcript: "yo",
-					audio_path: null,
-				},
-			],
-			{ model: "gpt-4o", temperature: 0.2 },
-		);
+		const replayA = buildReplay("11111111-1111-1111-1111-111111111111", [TURN_FIXTURE], {
+			model: "gpt-4",
+			temperature: 0.2,
+		});
+		const replayB = buildReplay("22222222-2222-2222-2222-222222222222", [TURN_FIXTURE], {
+			model: "gpt-4o",
+			temperature: 0.2,
+		});
 		server.use(
 			http.post("http://localhost/v1/replays/compare", () =>
 				HttpResponse.json({ replays: [replayA, replayB] }),
