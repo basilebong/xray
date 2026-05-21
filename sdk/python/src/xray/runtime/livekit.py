@@ -7,7 +7,7 @@ user, right = agent) at ``~/.cache/xray-py/replays/<replay>.wav``.
 
 User-side audio is sourced from a :class:`RecordedAudio` (WAV on disk)
 or a :class:`TtsAudio` (synthesized via OpenAI TTS and cached at
-``~/.cache/xray-py/<conv>/<fingerprint>.wav``).
+``~/.cache/xray-py/<conversation_hash>/<sha256(text,voice,model)[:16]>.wav``).
 
 The dev's OpenAI key stays in *their* process: the SDK calls OpenAI
 directly when synthesizing, never via xray.
@@ -120,15 +120,14 @@ class _TurnSegment:
 
 
 @dataclass
-class LiveKitDriver(Runtime):
+class LiveKitRuntime(Runtime):
     """Joins a LiveKit room as the user-side test driver. Plays per-turn
     audio (recorded or OpenAI-TTS), captures the agent's transcripts +
     audio, and writes one stereo WAV mixdown per replay.
 
     Despite living under ``xray.runtime``, this is the *user* side, not
-    the agent side. The name ``Driver`` distinguishes it from
-    LiveKit Agents' agent worker — which is the *other* side of the
-    same room."""
+    the agent side — the LiveKit Agents agent worker is the *other*
+    side of the same room."""
 
     url: str
     api_key: str = field(repr=False)
@@ -167,7 +166,7 @@ class LiveKitDriver(Runtime):
     async def run(self, conversation: Conversation) -> RuntimeResult:
         if self.replay_id is None or self.conversation_hash is None:
             raise RuntimeBindError(
-                "LiveKitDriver: bind(replay_id=..., conversation_hash=...) "
+                "LiveKitRuntime: bind(replay_id=..., conversation_hash=...) "
                 "must be called before run()."
             )
 
@@ -453,7 +452,9 @@ class LiveKitDriver(Runtime):
             case None:
                 # No explicit audio → fall back to TTS. The missing-text
                 # case is raised inside _synth_tts_pcm.
-                return await self._synth_tts_pcm(conv_hash=conv_hash, idx=idx, turn=turn, voice_id=None)
+                return await self._synth_tts_pcm(
+                    conv_hash=conv_hash, idx=idx, turn=turn, voice_id=None
+                )
             case _:
                 assert_never(turn.audio)
 
@@ -512,7 +513,7 @@ class LiveKitDriver(Runtime):
         set, no ``can_update_own_metadata`` grant needed."""
         if self.replay_id is None or self.conversation_hash is None:
             raise RuntimeBindError(
-                "LiveKitDriver: bind(replay_id=..., conversation_hash=...) "
+                "LiveKitRuntime: bind(replay_id=..., conversation_hash=...) "
                 "must be called before token minting."
             )
         attributes = encode_attribute(
@@ -538,7 +539,7 @@ class LiveKitDriver(Runtime):
             lk_api_mod: object = importlib.import_module("livekit.api")
         except ImportError as e:
             raise LiveKitDependencyError(
-                "LiveKitDriver requires `pip install xray-py[livekit]`."
+                "LiveKitRuntime requires `pip install xray-py[livekit]`."
             ) from e
         if not isinstance(lk_rtc_mod, LkRtcModule):
             raise LiveKitDependencyError(
@@ -620,7 +621,7 @@ async def _openai_tts_pcm(
     raw int16 PCM at 24 kHz."""
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
-            LiveKitDriver.OPENAI_API_URL,
+            LiveKitRuntime.OPENAI_API_URL,
             json={
                 "model": model,
                 "voice": voice,

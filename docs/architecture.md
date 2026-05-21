@@ -88,9 +88,9 @@ flowchart LR
   spec, plays the user audio, captures the agent audio, writes the
   stereo WAV, uploads it, then waits via SSE for the server to finish
   VAD + turn derivation. It is also the only thing that mints LiveKit
-  JWTs carrying the `xray` attribute (replay_id, conversation_id,
-  conversation_version, modality) — that JWT is how the agent side
-  learns which replay it's inside.
+  JWTs carrying the `xray` attribute (replay_id, conversation_hash,
+  modality) — that JWT is how the agent side learns which replay
+  it's inside.
 - The **agent worker** is the dev's own LiveKit Agents code, with one
   thin xray wrapper: `async with xray.attach(ctx, …)`. It runs the
   same way it would in production (because in production, no `xray`
@@ -119,7 +119,7 @@ flowchart TB
     subgraph WRITES["Write surfaces — trust boundary lives here"]
       direction LR
       subgraph CP["Control plane — Valibot-validated, idempotent"]
-        CP1["POST /v1/conversations<br/><i>upsert spec (id, version) → turns_json</i><br/>VersionFingerprintMismatchError on conflict"]
+        CP1["POST /v1/conversations<br/><i>upsert spec hash → turns_json</i><br/>VersionFingerprintMismatchError on conflict"]
         CP2["POST /v1/replays<br/><i>eager row create — lifecycle_state='pending'<br/>returns replay_id</i>"]
         CP3["POST /v1/replays/:id/audio<br/><i>stereo WAV → XRAY_AUDIO_ROOT<br/>lifecycle_state='recording_uploaded'</i>"]
         CP4["POST /v1/replays/:id/analyze<br/><i>enqueue bunqueue job<br/>lifecycle_state='analyzing'<br/>analysis_step='vad'</i>"]
@@ -161,7 +161,7 @@ flowchart TB
 in order:
 
 1. `POST /v1/conversations` — Valibot-validated upsert keyed by
-   `(id, version)`. The SDK auto-computes `version` as a fingerprint
+   `hash`. The SDK auto-computes `version` as a fingerprint
    over the canonical turn structure; the server rejects a same-key
    upsert with a different fingerprint as
    `VersionFingerprintMismatchError`.
@@ -232,7 +232,7 @@ sequenceDiagram
     D->>X: POST /v1/conversations<br/>(upsert spec, turns_json)
     D->>X: POST /v1/replays<br/>→ replay_id<br/>(lifecycle_state='pending')
     D->>D: install OTLP pipeline<br/>+ attach replay baggage
-    D->>LK: connect, mint JWT carrying<br/>xray attribute = {replay_id,<br/>conversation_id, version, modality}
+    D->>LK: connect, mint JWT carrying<br/>xray attribute = {replay_id,<br/>conversation_hash, modality}
     A->>LK: connect (agent worker joins room)
     A->>A: xray.attach reads JWT 'xray' attribute<br/>→ sets baggage, installs OTLP pipeline
 
@@ -276,7 +276,7 @@ Two things to notice in this diagram:
 
 ```mermaid
 erDiagram
-    conversations ||--o{ replays : "(conversation_id, conversation_version)"
+    conversations ||--o{ replays : "(conversation_hash)"
     replays ||--o{ replay_turns : "replay_id"
     replays ||--o{ speech_segments : "replay_id"
     replays ||--o{ tool_calls : "replay_id"
@@ -292,8 +292,7 @@ erDiagram
     }
     replays {
         text id PK
-        text conversation_id FK
-        text conversation_version FK
+        text conversation_hash FK
         text lifecycle_state "pending | running | recording_uploaded | analyzing | completed | failed"
         text analysis_step "vad | turns | null"
         text failure_reason "stalled | timeout | explicit_fail | max_attempts_exceeded | worker_lost | upload_failed | driver_aborted | null"

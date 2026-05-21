@@ -163,7 +163,6 @@ class Conversation:
 
 class RecordedAudioWirePayload(TypedDict):
     kind: Literal["recorded"]
-    path: str
     sha256: str
 
 
@@ -195,7 +194,7 @@ class ReplayCreateBody(TypedDict):
 def _audio_to_wire(audio: AudioRef) -> AudioWirePayload:
     match audio:
         case RecordedAudio(path=path):
-            return {"kind": "recorded", "path": path, "sha256": _sha256_file(path)}
+            return {"kind": "recorded", "sha256": _sha256_file(path)}
         case TtsAudio(voice_id=voice_id):
             if voice_id is None:
                 return {"kind": "tts"}
@@ -224,8 +223,49 @@ def _canonical_turns_json(turns_wire: list[TurnWirePayload]) -> str:
     Pinned wire contract shared with the TS server — see
     ``src/server/conversations/conversations.service.ts::canonicalStringify``
     and ``tests/fixtures/hash-parity.json`` for the parity vector.
+
+    Numbers are rejected for the same reason as the TS side: ``json.dumps``
+    and ``JSON.stringify`` disagree on float formatting (``1.0`` ↔ ``"1.0"``
+    vs ``"1"``), large-int boundaries, and ``-0``. Until a numeric field is
+    actually needed, locking the canonical input to null/bool/str/dict/list
+    keeps the SDK and server hashes bit-identical by construction.
     """
-    return json.dumps(turns_wire, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    encoded = json.dumps(turns_wire, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    _reject_numeric_tokens(encoded)
+    return encoded
+
+
+def _reject_numeric_tokens(encoded: str) -> None:
+    """Scan a JSON-encoded string and raise if any numeric token sits outside
+    a string literal.
+
+    JSON only allows alphabetic tokens outside strings for ``true`` / ``false``
+    / ``null`` — so any digit (or leading ``-``) outside a string is the start
+    of a number. ``\\uXXXX`` escapes contain hex but live inside strings.
+    Cheaper and less narrow-fighty than a typed tree walk over ``object``.
+    """
+    in_string = False
+    escape = False
+    for ch in encoded:
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "-" or ch.isdigit():
+            raise TypeError(
+                "Cannot canonicalize a number in conversation turns: "
+                "json.dumps and JSON.stringify disagree on numeric "
+                "formatting (floats, large ints, -0). Add a normalized "
+                "encoding to both sides before introducing a numeric field."
+            )
 
 
 def _hash_turns_wire(turns_wire: list[TurnWirePayload]) -> str:

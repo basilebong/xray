@@ -30,12 +30,13 @@ export const ConversationNameSchema = v.pipe(
 
 const TurnRoleSchema = v.picklist(["user", "agent"]);
 
+// sha256 of the WAV file bytes is the entire identity. The local filesystem
+// `path` deliberately doesn't ride the wire — it would make the conversation
+// hash machine-local (same checked-in spec produces different hashes on
+// different developers' boxes). The bytes are the conversation; the path is
+// the dev's local concern.
 const RecordedAudioRefSchema = v.object({
 	kind: v.literal("recorded"),
-	path: v.pipe(v.string(), v.nonEmpty(), v.maxLength(MAX_AUDIO_PATH)),
-	// sha256 of the WAV file bytes. The SDK computes this at hash time so
-	// editing the file changes the conversation hash. The server stores it
-	// alongside `path` so the canonical turns_json captures both.
 	sha256: v.pipe(v.string(), v.regex(HEX_SHA256_RE, "Must be a 64-char lowercase hex SHA-256")),
 });
 

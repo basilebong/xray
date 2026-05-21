@@ -1,4 +1,4 @@
-"""Unit tests for ``LiveKitDriver`` with the LiveKit room I/O stubbed.
+"""Unit tests for ``LiveKitRuntime`` with the LiveKit room I/O stubbed.
 
 We never hit the network: ``lk_rtc`` / ``lk_api`` are stub modules
 injected via the runtime's ``_lk_rtc`` / ``_lk_api`` fields. The fake
@@ -25,7 +25,7 @@ from xray.runtime.livekit import (
     NUM_CHANNELS,
     SAMPLE_RATE,
     SAMPLE_WIDTH_BYTES,
-    LiveKitDriver,
+    LiveKitRuntime,
     _TurnSegment,
     _upsample_2x_int16,
     write_stereo_mixdown,
@@ -195,8 +195,8 @@ def _runtime(
     lk_rtc: Any,
     lk_api: Any,
     openai_tts: Any | None = None,
-) -> LiveKitDriver:
-    rt = LiveKitDriver(
+) -> LiveKitRuntime:
+    rt = LiveKitRuntime(
         url="wss://fake",
         api_key="ak",
         api_secret="sk",
@@ -215,7 +215,7 @@ def _runtime(
 
 
 def test_bind_required_before_run():
-    rt = LiveKitDriver(url="x", api_key="k", api_secret="s", room="r")
+    rt = LiveKitRuntime(url="x", api_key="k", api_secret="s", room="r")
     conv = Conversation(name="c", turns=[Turn.user("hi")])
     with pytest.raises(RuntimeBindError) as exc:
         asyncio.run(rt.run(conv))

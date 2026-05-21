@@ -33,7 +33,6 @@ from xray import Conversation, Turn, run
 from xray.conversation import AgentResponse
 from xray.runtime.base import Runtime, RuntimeResult
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 pytestmark = pytest.mark.skipif(

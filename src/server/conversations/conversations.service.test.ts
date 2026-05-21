@@ -8,6 +8,7 @@ import { makeTempStore } from "@/server/store/test-utils.ts";
 import {
 	canonicalizeAndHashTurns,
 	canonicalizeTurns,
+	canonicalStringify,
 	computeConversationHash,
 	ensureConversation,
 	getConversationByHash,
@@ -109,6 +110,50 @@ describe("toConversationResponse", () => {
 		expect(response.hash).toBe(hash);
 		store.close();
 	});
+
+	it("returns empty turns and warns when turnsJson is unparseable", () => {
+		const warn = console.warn;
+		const calls: unknown[][] = [];
+		console.warn = (...args: unknown[]) => {
+			calls.push(args);
+		};
+		try {
+			const response = toConversationResponse({
+				hash: "deadbeef".repeat(8),
+				name: "corrupt row",
+				turnsJson: "{not valid json",
+				createdAt: "2026-05-18T12:00:00.000Z",
+				lastRunAt: null,
+			});
+			expect(response.turns).toEqual([]);
+			expect(calls.length).toBe(1);
+			expect(String(calls[0]?.[0])).toContain("JSON.parse failed");
+		} finally {
+			console.warn = warn;
+		}
+	});
+
+	it("returns empty turns and warns when turnsJson fails schema validation", () => {
+		const warn = console.warn;
+		const calls: unknown[][] = [];
+		console.warn = (...args: unknown[]) => {
+			calls.push(args);
+		};
+		try {
+			const response = toConversationResponse({
+				hash: "cafebabe".repeat(8),
+				name: "shape drift",
+				turnsJson: JSON.stringify([{ role: "user", text: 42 }]),
+				createdAt: "2026-05-18T12:00:00.000Z",
+				lastRunAt: null,
+			});
+			expect(response.turns).toEqual([]);
+			expect(calls.length).toBe(1);
+			expect(String(calls[0]?.[0])).toContain("schema validation failed");
+		} finally {
+			console.warn = warn;
+		}
+	});
 });
 
 describe("computeConversationHash", () => {
@@ -165,5 +210,25 @@ describe("computeConversationHash", () => {
 			expect(json, `case ${c.name}: canonical_json`).toBe(c.canonical_json);
 			expect(hash, `case ${c.name}: expected_hash`).toBe(c.expected_hash);
 		}
+	});
+
+	it("rejects numeric values in the canonical input", () => {
+		// `JSON.stringify(1.0)` is `"1"` while Python's `json.dumps(1.0)` is
+		// `"1.0"`; the hashes would silently diverge across languages the
+		// moment a numeric field landed in a turn. Lock it at the encoder.
+		// Tested via the lower-level `canonicalStringify(unknown)` so the
+		// test can pass deliberately-wrong shapes without an `as` cast.
+		expect(() => canonicalStringify([{ role: "user", text: "hi", key: "u0", score: 1 }])).toThrow(
+			/Cannot canonicalize a number/,
+		);
+		expect(() =>
+			canonicalStringify([{ role: "user", text: "hi", key: "u0", nested: { deep: [{ x: 1.5 }] } }]),
+		).toThrow(/Cannot canonicalize a number/);
+	});
+
+	it("accepts booleans (true/false roundtrip identically across encoders)", () => {
+		expect(() =>
+			canonicalStringify([{ role: "user", text: "hi", key: "u0", flag: true }]),
+		).not.toThrow();
 	});
 });

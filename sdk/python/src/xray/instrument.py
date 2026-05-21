@@ -356,7 +356,7 @@ def _parse_xray_attribute(attributes: dict[str, str]) -> ReplayContext | None:
     )
 
 
-# Re-exported for the driver side (LiveKitDriver builds the same JSON).
+# Re-exported for the driver side (LiveKitRuntime builds the same JSON).
 def encode_attribute(
     *,
     replay_id: str,

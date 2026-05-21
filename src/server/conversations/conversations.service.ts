@@ -86,17 +86,32 @@ export function ensureConversation(
 	return row;
 }
 
-function parseStoredTurns(raw: string): ConversationTurn[] {
+function parseStoredTurns(raw: string, hash: string): ConversationTurn[] {
 	// Stored rows were validated on the way in; a corrupt row (botched
 	// migration, fsck'd file) shouldn't 500 the entire conversation handler.
+	// Log loudly though — without this, the only signal an operator gets is
+	// an empty `turns` array and "the inspector shows a 0-turn conversation".
 	let parsedJson: unknown;
 	try {
 		parsedJson = JSON.parse(raw);
-	} catch {
+	} catch (err) {
+		console.warn(
+			"[conversations] turns_json JSON.parse failed for hash=%s; returning empty turns. err=%s",
+			hash,
+			err instanceof Error ? err.message : String(err),
+		);
 		return [];
 	}
 	const result = v.safeParse(TurnArraySchema, parsedJson);
-	return result.success ? result.output : [];
+	if (!result.success) {
+		console.warn(
+			"[conversations] turns_json schema validation failed for hash=%s; returning empty turns. issues=%s",
+			hash,
+			JSON.stringify(result.issues.map((i) => ({ path: i.path, message: i.message }))),
+		);
+		return [];
+	}
+	return result.output;
 }
 
 /** Project a stored row back onto the wire response shape. */
@@ -106,7 +121,7 @@ export function toConversationResponse(row: ConversationRow): ConversationRespon
 		name: row.name,
 		created_at: row.createdAt,
 		last_run_at: row.lastRunAt,
-		turns: parseStoredTurns(row.turnsJson),
+		turns: parseStoredTurns(row.turnsJson, row.hash),
 	};
 }
 
@@ -143,15 +158,21 @@ export function getConversationByHash(store: Store, hash: string): ConversationR
  * Python's `json.dumps(..., separators=(",", ":"), sort_keys=True,
  * ensure_ascii=True)`. Used for the conversation hash; the parity fixture
  * exercises it.
+ *
+ * Numbers are deliberately rejected: `JSON.stringify(1.0)` is `"1"` while
+ * Python's `json.dumps(1.0)` is `"1.0"`, and the two encoders disagree on
+ * large-int boundaries and `-0`. Until a numeric field is actually needed,
+ * locking the input to null/bool/string/object/array keeps the SDK and
+ * server hash bit-identical by construction. Mirror in
+ * `sdk/python/src/xray/conversation.py::_canonical_turns_json`.
  */
-function canonicalStringify(value: unknown): string {
+export function canonicalStringify(value: unknown): string {
 	if (value === null) return "null";
 	if (typeof value === "boolean") return value ? "true" : "false";
 	if (typeof value === "number") {
-		if (!Number.isFinite(value)) {
-			throw new TypeError("Cannot canonicalize non-finite number");
-		}
-		return JSON.stringify(value);
+		throw new TypeError(
+			"Cannot canonicalize a number: JSON.stringify and Python's json.dumps disagree on numeric formatting (floats, large ints, -0). Add a normalized encoding to both sides before introducing a numeric field.",
+		);
 	}
 	if (typeof value === "string") return escapeAscii(value);
 	if (Array.isArray(value)) {

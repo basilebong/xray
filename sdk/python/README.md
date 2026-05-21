@@ -63,7 +63,7 @@ asyncio.run(main())
 
 The runtime produces **one stereo WAV per replay** (left = user, right = agent); `run(...)` uploads it to `POST /v1/replays/:id/audio`. The inspector slices it per-turn using the `replay_turns` timestamps.
 
-When a user `Turn` uses `TtsAudio()` (or has no `audio` + a text fallback), the runtime calls OpenAI's `/v1/audio/speech` directly using `OPENAI_API_KEY` from your environment — xray never sees the key — and caches the result at `~/.cache/xray-py/<conversation_hash>/<voice_id>.wav` so re-runs reuse the bytes.
+When a user `Turn` uses `TtsAudio()` (or has no `audio` + a text fallback), the runtime calls OpenAI's `/v1/audio/speech` directly using `OPENAI_API_KEY` from your environment — xray never sees the key — and caches the result per-turn keyed on `(text, voice, model)` so re-runs reuse the bytes. Changing any of those invalidates the cache for that turn.
 
 ## Three modules
 
@@ -87,8 +87,8 @@ Recorded audio must be **48 kHz mono 16-bit WAV** (`ffmpeg -i in.wav -ar 48000 -
 ## How it wires to xray
 
 1. `run(...)` POSTs a Replay to `POST /v1/replays` carrying the full Conversation spec. The server hashes the turns to derive `conversation_hash`, upserts the conversation row by hash (last-write-wins on `name`), inserts the replay, and returns `{id, conversation_hash}`.
-2. The runtime joins the LiveKit room with `replay_id` + `conversation_hash` in room metadata.
-3. The dev's agent reads metadata, propagates it via OTEL baggage on every span.
+2. The runtime joins the LiveKit room with `replay_id` + `conversation_hash` encoded as a JWT participant attribute (LiveKit `participant.attributes` ≥ v1.7) — *not* room metadata, so no `can_update_own_metadata` grant is needed.
+3. `xray.attach(ctx, ...)` reads the attribute from `participant.attributes`, sets OTEL baggage on the agent side, and the `XrayBaggageSpanProcessor` lifts it onto every span.
 4. xray's OTLP receiver routes spans by `xray.replay.id` and persists what it recognizes (xray.*, OTel GenAI semconv, Langfuse).
 5. `run(...)` uploads the mixdown WAV to `POST /v1/replays/:id/audio`.
 6. `run(...)` evaluates per-turn assertions and PATCHes the Replay row with the final status.

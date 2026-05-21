@@ -105,7 +105,7 @@
     },
     {
       "name": "recorded_audio",
-      "description": "User turn with RecordedAudio wire payload (kind+path+sha256).",
+      "description": "User turn with RecordedAudio wire payload (kind+sha256). `path` deliberately doesn't ride the wire — it would make the conversation hash machine-local.",
       "turns_wire": [
         {
           "role": "user",
@@ -113,7 +113,6 @@
           "key": "u0",
           "audio": {
             "kind": "recorded",
-            "path": "/tmp/a.wav",
             "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
           }
         },
@@ -122,8 +121,8 @@
           "key": "a0"
         }
       ],
-      "canonical_json": "[{\"audio\":{\"kind\":\"recorded\",\"path\":\"/tmp/a.wav\",\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"},\"key\":\"u0\",\"role\":\"user\",\"text\":\"hi\"},{\"key\":\"a0\",\"role\":\"agent\"}]",
-      "expected_hash": "3aa042dbef1db6209d0ac2693087c313a136059433edabc0e756f3cb35700399"
+      "canonical_json": "[{\"audio\":{\"kind\":\"recorded\",\"sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"},\"key\":\"u0\",\"role\":\"user\",\"text\":\"hi\"},{\"key\":\"a0\",\"role\":\"agent\"}]",
+      "expected_hash": "bdcb7d70af24f8a6a9dc1d1af27fcaa596eb00e0d786d0849fc0fecd5c5fb29d"
     },
     {
       "name": "tts_no_voice",
