@@ -1,0 +1,4 @@
+# Local-only artifacts. Real secrets + DB dumps for inspection — never
+# commit. Root .gitignore already covers `.env`; this file makes the
+# intent visible at the example's own root + adds the db-dump path.
+/data-dump/

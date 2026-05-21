@@ -1,0 +1,17 @@
+# LiveKit config — local example only.
+#
+# Used instead of `--dev` so we control the keys (the Python SDK rejects
+# secrets shorter than 32 chars when minting JWTs). The actual STUN
+# suppression happens at the Docker network layer — see the `dns:`
+# block on the livekit service in compose.yaml.
+#
+# Keys inlined: only listens on the compose-internal network.
+port: 7880
+log_level: info
+
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+
+keys:
+  devkey: devsecret32charsminimumlengthxyz123
