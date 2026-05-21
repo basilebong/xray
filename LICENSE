@@ -96,3 +96,56 @@ licenses.
 ---
 
 Copyright (c) 2026 Basile Bong.
+
+---
+
+## Addendum — non-binding explanatory notes
+
+This addendum is **non-binding commentary** on the Elastic License 2.0
+above. The license text is the contract; this section exists so a
+reader who is not a lawyer can apply the three rules in `## Limitations`
+to xray's expected use cases. If this addendum and the license
+disagree, the license wins.
+
+### The three Limitations, in plain English
+
+1. **No managed-service offering.** You may run xray for *your own*
+   organization — yourself, your team, your company, your household,
+   or your customers' agents being tested *by you*. You may not stand
+   xray up as a service that *other* organizations log into and use
+   as their replay/eval tool.
+
+2. **No circumventing the license-key mechanism.** xray ships with no
+   license-key gating at the time of writing; this rule is currently
+   a no-op in practice but remains binding if a future release adds
+   one.
+
+3. **No removing or altering license notices.** Don't strip `LICENSE`
+   or `NOTICE` from forks or downstream redistributions. Modifying
+   xray itself is fine — the license grants derivative-works rights —
+   but the attribution travels with the code.
+
+### Self-hosted family use is the primary intent
+
+Running xray on hardware *you control* — your laptop, your homelab,
+your team's k8s cluster, a friend's NAS — to debug agents that *you
+and the people in your trust boundary* are building, is the use case
+this license was chosen to allow. The "no managed service" line is
+about commercial fan-out to unrelated third parties, not about who
+is sitting at the keyboard.
+
+### Dependency-license discipline
+
+xray bundles its production dependencies into the published Docker
+image at `ghcr.io/xray-eval/xray`. To keep that image redistributable
+under the ELv2, every production dependency must be under a
+permissive license: MIT, Apache-2.0, BSD-*, ISC, 0BSD, Unlicense,
+CC0-1.0, Python-2.0 (PSF), or OFL-1.1 for fonts. The `NOTICE` file
+in the repository root enumerates the categories and gives
+attribution where the license requires it.
+
+`bun run license:check` walks `pnpm licenses list --prod --json` and
+fails the build if any production dependency is under GPL-*, AGPL-*,
+or SSPL-*. The same script runs in CI in the `Supply-chain audit`
+job, so a PR that adds a copyleft dependency is rejected before
+merge.

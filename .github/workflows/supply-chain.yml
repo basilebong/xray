@@ -46,6 +46,13 @@ jobs:
           # run — exactly the dependency-injection vector we're closing.
           node-version-file: '.nvmrc'
 
+      # Pinned via .tool-versions (single source of truth for local dev,
+      # Docker, and CI). Owns the license:check script invocation below.
+      - name: Setup Bun (pinned via .tool-versions)
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2.2.0
+        with:
+          bun-version-file: '.tool-versions'
+
       # Corepack must run AFTER setup-node: current pnpm (11.x) requires
       # Node ≥22.13, and the runner's pre-installed Node is older than that.
       # package.json#packageManager is the source of truth for the pnpm
@@ -79,6 +86,12 @@ jobs:
 
       - name: Audit known vulnerabilities (fail on moderate+)
         run: pnpm audit --audit-level=moderate
+
+      - name: Reject GPL/AGPL/SSPL production dependencies
+        # Bundled image must stay redistributable under ELv2. The script
+        # mirrors what `bun run license:check` does locally — same code path,
+        # same exit code. See the addendum in LICENSE.
+        run: pnpm license:check
 
       - name: Reject exotic or non-registry resolutions in the lockfile
         # blockExoticSubdeps already prevents this at install time; this is a

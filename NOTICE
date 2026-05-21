@@ -1,0 +1,94 @@
+xray
+Copyright (c) 2026 Basile Bong.
+
+This product is distributed under the Elastic License 2.0; see the
+`LICENSE` file at the repository root for the full text and the
+non-binding explanatory addendum.
+
+The published Docker image at `ghcr.io/xray-eval/xray` bundles a
+number of third-party packages. Their copyright notices and license
+terms are reproduced below, grouped by license class. The exhaustive
+per-package list is reproducible from the committed lockfile via:
+
+    pnpm install --frozen-lockfile
+    pnpm licenses list --prod
+
+`bun run license:check` verifies on every CI run that no production
+dependency is under GPL-*, AGPL-*, or SSPL-*; the build fails if one
+slips in.
+
+---
+
+## License classes currently present in the production dependency set
+
+(Sourced from `pnpm licenses list --prod --json` against the
+committed `pnpm-lock.yaml`. Last verified manually: see commit log.)
+
+- **MIT** — the bulk of the runtime tree (React, Hono, Drizzle ORM,
+  Radix UI primitives, TanStack Query / Router, valibot, ts-pattern,
+  ky, tailwindcss, lucide-react, and roughly a hundred transitive
+  dependencies).
+- **Apache-2.0** — a small number of utility packages.
+- **ISC** — a handful of small utilities.
+- **0BSD** — one dependency.
+- **Unlicense** — one dependency.
+- **(MIT OR CC0-1.0)** — one dual-licensed dependency.
+- **OFL-1.1** — `@fontsource-variable/jetbrains-mono` and
+  `@fontsource-variable/onest`. See the per-font attribution below.
+
+No production dependency is under a copyleft license (GPL, LGPL,
+AGPL, SSPL, MPL, EPL, CDDL, CC-BY-SA, or EUPL) at the time of
+writing.
+
+---
+
+## Per-package attribution where the license requires it
+
+### Fonts (SIL Open Font License 1.1)
+
+Both bundled variable fonts ship under the SIL Open Font License,
+Version 1.1 — <https://openfontlicense.org/open-font-license-official-text/>.
+The OFL requires that the original copyright lines be preserved
+when the fonts are redistributed.
+
+- **JetBrains Mono** — Copyright (c) 2020, JetBrains s.r.o.
+  (<https://www.jetbrains.com/>) with Reserved Font Name "JetBrains
+  Mono". Source: <https://github.com/JetBrains/JetBrainsMono>,
+  packaged as `@fontsource-variable/jetbrains-mono`.
+
+- **Onest** — Copyright (c) 2023, the Onest Project Authors
+  (<https://github.com/RKDronel/Onest>). Packaged as
+  `@fontsource-variable/onest`.
+
+### All other categories (MIT / Apache-2.0 / BSD / ISC / 0BSD /
+Unlicense / CC0)
+
+Each individual package preserves its own copyright header inside
+`node_modules/<package>/LICENSE` (or equivalent). Those headers
+travel with the source tree and are reproduced in the Docker image
+under `/app/node_modules/`. Running
+
+    pnpm licenses list --prod --long
+
+prints every license file inline.
+
+---
+
+## What changes here when a dependency is added or removed
+
+1. Add the dependency via `pnpm add` (subject to the 7-day cooldown
+   policy in `.claude/rules/supply-chain.md`).
+2. Run `bun run license:check` locally. If the package's license is
+   in the forbidden set, the script exits non-zero and the PR is
+   blocked.
+3. If the new license is a class not yet listed above (e.g. the first
+   `BlueOak-1.0.0` dep), append it to the License-classes section
+   above with the same wording as the others.
+4. If the new package's license requires explicit attribution beyond
+   "license file preserved in `node_modules`" — fonts, art assets,
+   any package that ships a `NOTICE` of its own — append the
+   attribution block to the per-package section above.
+
+This file is not auto-generated; it is curated. The verification
+script (`scripts/license-check.ts`) is what guards the dependency
+set on every push.
