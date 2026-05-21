@@ -362,6 +362,14 @@ class LiveKitRuntime(Runtime):
         track = agent_audio_track_holder[-1]
         stream = lk_rtc.AudioStream(track, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS)
 
+        # A stale `final=True` segment left in the queue from the prior
+        # agent turn would satisfy this turn's `final_seen` on the first
+        # drainer iteration and end the turn before any new audio is
+        # captured. Drop pre-turn segments before installing the drainer.
+        while not transcription_queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                transcription_queue.get_nowait()
+
         segment = _TurnSegment(role="agent", idx=idx, key=turn.key)
         transcript_buf: list[str] = []
         final_seen = asyncio.Event()

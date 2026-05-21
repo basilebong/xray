@@ -109,19 +109,34 @@ class _FakeLocalAudioTrack:
 
 class _FakeAudioStream:
     """Async-iterable that yields one event per frame attached to the
-    given track via the ``_xray_frames`` attribute."""
+    given track via the ``_xray_frames`` attribute.
+
+    Tests may also attach ``_xray_after_frame_callbacks`` — a list (same
+    length as ``_xray_frames``) of optional zero-arg callables. After each
+    frame is yielded, the corresponding callback (if any) fires. This
+    lets a test fire a ``transcription_received`` room event DURING an
+    agent turn rather than during the (pre-turn) connect step — which is
+    what really happens in production and what the SDK's queue-draining
+    logic correctly expects."""
 
     def __init__(self, track: Any, **_: Any) -> None:
         self.frames: list[bytes] = list(getattr(track, "_xray_frames", []))
+        self.after_frame_callbacks: list[Any] = list(
+            getattr(track, "_xray_after_frame_callbacks", [])
+        )
         self.aclose = AsyncMock(return_value=None)
 
     def __aiter__(self) -> AsyncIterator[Any]:
         async def _gen() -> AsyncIterator[Any]:
-            for f in self.frames:
+            for i, f in enumerate(self.frames):
                 event = MagicMock()
                 event.frame = MagicMock()
                 event.frame.data = f
                 yield event
+                if i < len(self.after_frame_callbacks):
+                    cb = self.after_frame_callbacks[i]
+                    if cb is not None:
+                        cb()
 
         return _gen()
 
@@ -295,13 +310,27 @@ def test_runtime_captures_agent_turn_via_transcription(tmp_path: Path):
     wav_path = tmp_path / "u0.wav"
     _write_recorded_wav(wav_path, ms=40)
 
+    track_event = _stage_agent_track([_make_silence_pcm(20), _make_silence_pcm(20)])
+    track_obj = track_event[1][0]
+    transcription_event = _stage_transcription_final("confirmed at 7pm")
     rtc = _build_fake_lk_rtc(
         staged_events=[
             _stage_agent_join(),
-            _stage_agent_track([_make_silence_pcm(20), _make_silence_pcm(20)]),
-            _stage_transcription_final("confirmed at 7pm"),
+            track_event,
         ]
     )
+
+    # Fire the transcription_received event AFTER the first audio frame is
+    # yielded (during the agent turn), not at connect-time. This mirrors
+    # real Gemini Live behavior: transcripts arrive while the agent emits
+    # audio, not before. The SDK now drains stale queue entries at the
+    # start of each agent turn (regression: a final segment that arrived
+    # between turns would satisfy the next turn's `final_seen` event in
+    # microseconds).
+    def _fire_transcription() -> None:
+        rtc.Room.rooms[0].fire(transcription_event[0], *transcription_event[1])
+
+    track_obj._xray_after_frame_callbacks = [_fire_transcription, None]
     api = _build_fake_lk_api()
     rt = _runtime(tmp_path, rtc, api)
     rt.agent_turn_timeout_s = 2.0
@@ -330,6 +359,75 @@ def test_runtime_captures_agent_turn_via_transcription(tmp_path: Path):
         # depends on real timing.
         nframes = w.getnframes()
         assert SAMPLE_RATE * 40 // 1000 <= nframes <= SAMPLE_RATE * 80 // 1000
+
+
+def test_runtime_drains_stale_transcripts_between_agent_turns(tmp_path: Path):
+    """A ``final=True`` transcription segment that arrives between two
+    agent turns (e.g. delayed `conversation_item_added` from Gemini Live
+    after the prior turn's audio ended) must NOT satisfy the next agent
+    turn's ``final_seen`` event. Without the queue-drain on entry to
+    ``_capture_agent_turn``, the stale segment would end the next turn
+    in microseconds and the recording would stop before the agent emits
+    any audio for it (the bug surfaced in
+    ``examples/livekit-voice-agent/`` as a 2-turn server-derived VAD
+    output for a 3-turn conversation)."""
+
+    wav_path = tmp_path / "u0.wav"
+    _write_recorded_wav(wav_path, ms=40)
+
+    track_event = _stage_agent_track([_make_silence_pcm(20)])
+    track_obj = track_event[1][0]
+    # Fire a final segment for the FIRST agent turn during its frame play.
+    first_final = _stage_transcription_final("first")
+    # The stale segment for the user turn — fires during user playback
+    # (between agent turn 0 and agent turn 2). Without the fix, agent
+    # turn 2 picks this up as its own and ends instantly.
+    stale = _stage_transcription_final("stale")
+
+    rtc = _build_fake_lk_rtc(
+        staged_events=[
+            _stage_agent_join(),
+            track_event,
+        ]
+    )
+
+    def _fire_first() -> None:
+        rtc.Room.rooms[0].fire(first_final[0], *first_final[1])
+
+    track_obj._xray_after_frame_callbacks = [_fire_first]
+
+    api = _build_fake_lk_api()
+    rt = _runtime(tmp_path, rtc, api)
+    rt.agent_turn_timeout_s = 0.3
+
+    # Wrap _play_user_turn to fire the stale event AFTER the user turn
+    # plays — between agent turns 0 and 2 — matching the real-world
+    # window when Gemini Live's delayed `conversation_item_added` fires.
+    original_play_user_turn = rt._play_user_turn
+
+    async def _wrapped_play_user_turn(**kw: Any) -> Any:
+        result = await original_play_user_turn(**kw)
+        rtc.Room.rooms[0].fire(stale[0], *stale[1])
+        return result
+
+    rt._play_user_turn = _wrapped_play_user_turn
+
+    conv = Conversation(
+        name="c",
+        turns=[
+            Turn.agent(key="a0"),
+            Turn.user("hi", key="u0", audio=RecordedAudio(path=str(wav_path))),
+            Turn.agent(key="a1"),
+        ],
+    )
+
+    result = asyncio.run(rt.run(conv))
+    # Agent turn 0 should capture "first".
+    assert "first" in result.responses[0].transcript
+    # Agent turn 2 must NOT inherit "stale" — it should drain the queue
+    # on entry and (since no new segments arrive for it) time out with
+    # an empty transcript.
+    assert "stale" not in result.responses[2].transcript
 
 
 def test_runtime_raises_agent_not_joined_on_timeout(tmp_path: Path):
@@ -416,13 +514,23 @@ def test_driver_emits_xray_turn_for_user_and_agent(tmp_path: Path, monkeypatch: 
     wav_path = tmp_path / "u0.wav"
     _write_recorded_wav(wav_path, ms=40)
 
+    track_event = _stage_agent_track([_make_silence_pcm(20), _make_silence_pcm(20)])
+    track_obj = track_event[1][0]
+    transcription_event = _stage_transcription_final("confirmed at 7pm")
     rtc = _build_fake_lk_rtc(
         staged_events=[
             _stage_agent_join(),
-            _stage_agent_track([_make_silence_pcm(20), _make_silence_pcm(20)]),
-            _stage_transcription_final("confirmed at 7pm"),
+            track_event,
         ]
     )
+
+    # Fire the transcription during the agent turn (after the first frame
+    # is yielded). Pre-turn fire would be drained by the stale-queue
+    # guard in `_capture_agent_turn`.
+    def _fire_transcription() -> None:
+        rtc.Room.rooms[0].fire(transcription_event[0], *transcription_event[1])
+
+    track_obj._xray_after_frame_callbacks = [_fire_transcription, None]
     api = _build_fake_lk_api()
     rt = _runtime(tmp_path, rtc, api)
     rt.agent_turn_timeout_s = 2.0
