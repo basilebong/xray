@@ -10,7 +10,8 @@ end-to-end to prove the wiring.
 ├── .env.example           ← only GEMINI_API_KEY required
 ├── agent/main.py          ← the one xray.attach() call
 ├── driver/test_e2e.py     ← pytest; drives one Replay
-└── fixtures/user_turn_1.wav  ← 48kHz mono int16, ~2s
+├── fixtures/user_turn_1.wav  ← 48kHz mono int16, ~2s
+└── snapshot/              ← committed DB + audio from one canonical run
 ```
 
 ## Quickstart
@@ -74,3 +75,37 @@ ffmpeg -i input.wav -ar 48000 -ac 1 -sample_fmt s16 output.wav
 ```
 
 or use `TtsAudio()` with `OPENAI_API_KEY` set in your driver process.
+
+## The snapshot
+
+`snapshot/` is a checked-in capture of one full example run — `xray.db`
+plus the per-replay audio under `audio/`. It replaces the previous
+synthetic `pnpm seed` script: the inspector now has authentic data to
+render without anyone needing to run the example.
+
+Total size: ~2.2 MB (104 KB DB + 2.1 MB audio: stereo mixdown +
+recorded user-turn WAV).
+
+To browse it, mount it into a fresh xray container:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v $(pwd)/snapshot:/data \
+  ghcr.io/xray-eval/xray
+```
+
+Regenerate after schema changes or example-agent changes that affect
+emitted spans:
+
+```bash
+docker compose down -v
+docker compose up --build -d
+docker compose --profile test run --rm driver
+docker compose exec xray bun -e \
+  'import { Database } from "bun:sqlite"; const db = new Database("/data/xray.db"); db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); db.close();'
+rm -rf snapshot
+mkdir snapshot
+docker cp example-xray:/data/xray.db snapshot/xray.db
+docker cp example-xray:/data/audio   snapshot/audio
+docker compose down -v
+```
