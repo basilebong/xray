@@ -119,7 +119,7 @@ flowchart TB
     subgraph WRITES["Write surfaces — trust boundary lives here"]
       direction LR
       subgraph CP["Control plane — Valibot-validated, idempotent"]
-        CP1["POST /v1/conversations<br/><i>upsert spec hash → turns_json</i><br/>VersionFingerprintMismatchError on conflict"]
+        CP1["POST /v1/conversations<br/><i>multipart spec + audio bytes<br/>server hashes canonical turns → conversation_hash<br/>upsert by hash (last-write-wins on name)</i>"]
         CP2["POST /v1/replays<br/><i>eager row create — lifecycle_state='pending'<br/>returns replay_id</i>"]
         CP3["POST /v1/replays/:id/audio<br/><i>stereo WAV → XRAY_AUDIO_ROOT<br/>lifecycle_state='recording_uploaded'</i>"]
         CP4["POST /v1/replays/:id/analyze<br/><i>enqueue bunqueue job<br/>lifecycle_state='analyzing'<br/>analysis_step='vad'</i>"]
@@ -161,10 +161,14 @@ flowchart TB
 in order:
 
 1. `POST /v1/conversations` — Valibot-validated upsert keyed by
-   `hash`. The SDK auto-computes `version` as a fingerprint
-   over the canonical turn structure; the server rejects a same-key
-   upsert with a different fingerprint as
-   `VersionFingerprintMismatchError`.
+   `hash`. Multipart body: a `spec` JSON part with `name` + `turns`,
+   plus one named file part per `RecordedAudio` turn keyed by the
+   turn's declared `upload_key`. The server reads each audio part,
+   sha256s the bytes, substitutes the hash into the canonical turn,
+   then hashes the canonical turn JSON to derive `conversation_hash`.
+   Re-POSTing the same hash with a different `name` updates the
+   row's display label (last-write-wins). The SDK never hashes
+   anything.
 2. `POST /v1/replays` — creates the Replay row **eagerly** at
    `lifecycle_state='pending'` and returns `replay_id`. This must
    happen before the runtime emits its first span; otherwise the OTLP
@@ -284,11 +288,11 @@ erDiagram
     replays ||--o{ spans : "replay_id (raw OTLP)"
 
     conversations {
-        text id PK
-        text version PK
-        text turns_json "JSON-encoded spec — full Turn[] incl. user text + audio refs"
-        text title
+        text hash PK "SHA-256 of canonical turn JSON (incl. sha256 of RecordedAudio bytes)"
+        text name "Free-form display label; last-write-wins on re-POST"
+        text turns_json "JSON-encoded canonical turn array — the hash input"
         text created_at
+        text last_run_at "Bumped on every POST /v1/conversations"
     }
     replays {
         text id PK
@@ -350,8 +354,8 @@ container start.
 ```mermaid
 flowchart LR
     UI["Inspector SPA<br/>(React)"]
-    EP1["GET /v1/conversations<br/>GET /v1/conversations/:id"]
-    EP2["GET /v1/conversations/:id/replays<br/>(every replay across versions)"]
+    EP1["GET /v1/conversations<br/>GET /v1/conversations/:hash"]
+    EP2["GET /v1/conversations/:hash/replays<br/>(every replay for this hash)"]
     EP3["GET /v1/replays/:id<br/>(buildReplayDetail — the<br/>big join)"]
     EP4["POST /v1/replays/compare<br/>(body: 2–8 replay ids)"]
     EP5["GET /v1/replays/:id/audio<br/>(stereo WAV bytes)"]

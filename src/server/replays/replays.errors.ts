@@ -56,11 +56,9 @@ export class ReplayNotFoundError extends ReplayError {
 }
 
 /**
- * A PATCH attempted to move the replay out of a terminal lifecycle state.
- * Terminal states (`completed`, `failed`) are write-once. The SDK is the
- * sole writer for non-server-owned transitions and only emits one terminal
- * PATCH per run — a follow-up PATCH that "rescues" or rewrites the outcome
- * would mask whatever flagged it.
+ * A PATCH attempted an illegal lifecycle transition. Terminal states
+ * (`completed`, `failed`) are write-once; `analyzing` is owned by the
+ * worker. Mapped to 409.
  */
 export class ReplayLifecycleTransitionError extends ReplayError {
 	readonly replayId: string;

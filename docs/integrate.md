@@ -102,7 +102,7 @@ async def entrypoint(ctx: JobContext) -> None:
     async with xray.attach(ctx, service_name="my-agent") as session:
         # `session` is None when no xray-tagged participant joined.
         # Inside the block, OTEL baggage carries:
-        #   xray.replay.id, xray.conversation.id, xray.conversation.version, xray.modality
+        #   xray.replay.id, xray.conversation.hash, xray.modality
         # The bundled span processor lifts those onto every span at start.
         # On block exit, the tracer provider force-flushes so spans land
         # in xray before the worker shuts down.

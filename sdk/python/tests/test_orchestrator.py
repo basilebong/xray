@@ -435,6 +435,61 @@ async def test_run_raises_xray_server_error_on_post_replay_failure():
 
 
 @respx.mock
+async def test_run_tolerates_409_on_final_patch():
+    """When the final PATCH returns 409 (server already owns the lifecycle —
+    e.g. analyze worker stamped the row terminal before the SDK's PATCH landed),
+    the orchestrator must NOT raise. The server's lifecycle wins; the SDK logs
+    and returns a normal RunResult with its own evaluated status."""
+    conv = Conversation(name="x", turns=[Turn.user("hi", key="u0")])
+    runtime = StubRuntime(responses=[AgentResponse(transcript="ok")])
+
+    replay_id = "00000000-0000-0000-0000-000000000409"
+    respx.post("http://xray.local/v1/conversations").mock(
+        return_value=httpx.Response(200, json=_conversation_upsert_response())
+    )
+    respx.post("http://xray.local/v1/replays").mock(
+        return_value=httpx.Response(201, json=_replay_response(replay_id))
+    )
+    patch_replay = respx.patch(f"http://xray.local/v1/replays/{replay_id}").mock(
+        return_value=httpx.Response(
+            409, json={"error": "replay_lifecycle_transition", "from": "analyzing", "to": "completed"}
+        )
+    )
+
+    # Must not raise — 409 on the final PATCH is tolerated, not fatal.
+    result = await run(conversation=conv, runtime=runtime, xray_url="http://xray.local")
+
+    assert patch_replay.called
+    # SDK-side outcome reflects what the runtime + assertions produced; the
+    # server's final-state divergence is logged, not surfaced as a failure.
+    assert result.status == "completed"
+    assert result.id == replay_id
+
+
+@respx.mock
+async def test_run_raises_xray_server_error_on_non_409_patch_failure():
+    """A 500 (or any non-409 non-2xx) on the final PATCH must still surface as
+    a typed XrayServerError — 409 is the only tolerated status."""
+    conv = Conversation(name="x", turns=[Turn.user("hi", key="u0")])
+    runtime = StubRuntime(responses=[AgentResponse(transcript="ok")])
+
+    replay_id = "00000000-0000-0000-0000-0000000005ff"
+    respx.post("http://xray.local/v1/conversations").mock(
+        return_value=httpx.Response(200, json=_conversation_upsert_response())
+    )
+    respx.post("http://xray.local/v1/replays").mock(
+        return_value=httpx.Response(201, json=_replay_response(replay_id))
+    )
+    respx.patch(f"http://xray.local/v1/replays/{replay_id}").mock(
+        return_value=httpx.Response(500, text="patch exploded")
+    )
+
+    with pytest.raises(XrayServerError) as exc_info:
+        await run(conversation=conv, runtime=runtime, xray_url="http://xray.local")
+    assert exc_info.value.status_code == 500
+
+
+@respx.mock
 async def test_run_skips_pre_flight_for_tts_audio_refs():
     conv = Conversation(
         name="x",

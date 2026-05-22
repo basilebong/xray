@@ -1,14 +1,22 @@
 """``xray.run(...)`` — convenience orchestrator.
 
-1. POST the Replay (carries the full Conversation spec). Server computes
-   the conversation hash, upserts the conversation row if new, creates
-   the replay, returns ``replay_id``.
-2. Bind the runtime + run it.
-3. Upload the runtime's mixdown WAV (if produced).
-4. Fetch the rich per-turn server view (tool calls, model usage, stage
+1. POST the Conversation (multipart: ``spec`` JSON + one file part per
+   ``RecordedAudio`` turn). Server hashes the canonical turn JSON (with
+   sha256 of each WAV's bytes substituted in) and returns
+   ``conversation_hash``.
+2. POST the Replay referencing ``conversation_hash``. Server returns
+   ``replay_id``.
+3. Bind the runtime + wire the driver-side OTEL pipeline.
+4. Run the runtime.
+5. Upload the runtime's mixdown WAV (if produced).
+6. Kick off server-side analyze + wait via SSE for the terminal event
+   (best-effort; SSE drop demotes us to the legacy path).
+7. Fetch the rich per-turn server view (tool calls, model usage, stage
    timings) and merge it into each ``AgentResponse``.
-5. Evaluate per-turn assertions.
-6. PATCH the Replay row with final status.
+8. Evaluate per-turn assertions.
+9. Fire the per-replay judge (if any).
+10. PATCH the Replay row with final status (409 tolerated — server owns
+    lifecycle).
 
 Type safety: every outbound JSON body is a ``TypedDict``; the
 sync/async assertion predicates are typed via the aliases in
@@ -174,7 +182,8 @@ async def run(
         )
         conversation_hash = conversation_upsert.hash
 
-        # 2. Create Replay eagerly so the runtime can propagate the id.
+        # 2. Create Replay eagerly so the runtime can propagate the id
+        # via OTEL baggage BEFORE the dev's agent emits its first span.
         create_body: ReplayCreateBody = {"conversation_hash": conversation_hash}
         if run_config is not None:
             create_body["run_config"] = run_config.to_wire()
@@ -183,14 +192,14 @@ async def run(
         replay_create = _read_response(r.json(), _ReplayCreateResponse, "POST /v1/replays")
         replay_id = replay_create.id
 
-        # 2. Bind runtime.
+        # 3. Bind runtime.
         if isinstance(runtime, RuntimeBindable):
             runtime.bind(
                 replay_id=replay_id,
                 conversation_hash=conversation_hash,
             )
 
-        # 2b. Wire the driver-side OTEL pipeline. Mirrors what
+        # 3b. Wire the driver-side OTEL pipeline. Mirrors what
         # ``xray.attach`` does on the agent side — install the OTLP/JSON
         # exporter + baggage processor, set the replay-scope baggage so
         # spans emitted by the runtime (e.g. ``xray.turn`` for user
@@ -202,7 +211,7 @@ async def run(
             modality="voice",
         )
 
-        # 3. Run the runtime. Typed errors surface their own
+        # 4. Run the runtime. Typed errors surface their own
         # `failure_reason`; everything else falls through to a generic
         # `driver_aborted` PATCH — no substring matching, per the
         # restructure contract.
@@ -225,7 +234,7 @@ async def run(
             tracer_provider.force_flush(timeout_millis=10_000)
             otel_context.detach(baggage_token)
 
-        # 4. Upload mixdown if produced.
+        # 5. Upload mixdown if produced.
         if (
             runtime_result is not None
             and runtime_result.full_audio_path is not None
@@ -244,7 +253,7 @@ async def run(
                 logger.exception("audio upload errored on replay %s", replay_id)
                 status, failure_reason = "failed", "driver_aborted"
 
-        # 5b. Kick off server-side VAD/turn analysis if we uploaded audio.
+        # 6. Kick off server-side VAD/turn analysis if we uploaded audio.
         # Best-effort: a 4xx / 5xx here (e.g. server in dev mode, endpoint not
         # yet deployed, or replay state mismatch) demotes us to the legacy
         # path — the assertions below still get the old per-turn enrichment
@@ -268,7 +277,7 @@ async def run(
             except Exception:
                 logger.warning("could not start analysis for replay %s", replay_id, exc_info=True)
 
-        # 5c. Wait for analysis to terminate via SSE. Also best-effort.
+        # 7. Wait for analysis to terminate via SSE. Also best-effort.
         # If the server stamped the row `failed` (e.g. bunqueue exhausted
         # retries → onFailed → markReplayFailed), we must flip the SDK-side
         # status to match: the server's `updateReplay` blocks
@@ -291,7 +300,7 @@ async def run(
                     )
                     status = "failed"
 
-        # 5. Fetch the rich per-turn view and merge into each agent
+        # 8. Fetch the rich per-turn view and merge into each agent
         # response so assertions see tool_calls / model_usage / stage
         # timings.
         responses: list[AgentResponse] = (
@@ -302,7 +311,7 @@ async def run(
             conversation=conversation, responses=responses, enrichment=enrichment
         )
 
-        # 6. Per-turn assertions.
+        # 9. Per-turn assertions.
         assertions: list[AssertionOutcome] = []
         turn_records: list[TurnRecord] = []
         for idx, (turn, response) in enumerate(zip(conversation.turns, responses, strict=True)):
@@ -320,7 +329,7 @@ async def run(
                 assertions.append(outcome)
             turn_records.append(record)
 
-        # 7. Judge.
+        # 10. Judge.
         if conversation.judge is not None and status == "completed":
             replay_result = ReplayResult(
                 conversation_hash=conversation_hash,
@@ -337,12 +346,12 @@ async def run(
             except Exception:
                 logger.exception("judge raised for replay %s", replay_id)
 
-        # 8. PATCH.
+        # 11. PATCH.
         patch_body = _build_patch_body(status=status, failure_reason=failure_reason)
         r = await client.patch(f"/v1/replays/{replay_id}", json=patch_body)
         if r.status_code == 409:
             # Server already owns the lifecycle — either still `analyzing`
-            # (SSE wait at step 4 didn't see the terminal event in time) or
+            # (SSE wait at step 7 didn't see the terminal event in time) or
             # already terminal with a different `lifecycle_state` than we
             # would have written. Server's truth wins; trying to force ours
             # would mean re-fetching + re-PATCHing in a loop with no guarantee

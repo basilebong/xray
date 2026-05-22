@@ -113,8 +113,13 @@ export interface EnsureConversationInput {
 /**
  * Idempotent upsert of a Conversation row keyed by `hash`. On first POST
  * inserts; on subsequent POSTs with the same hash, updates `name`
- * (last-write-wins on display label) and `last_run_at` (denormalized for
- * list ordering).
+ * (last-write-wins on display label) and bumps `last_run_at` to `now`.
+ *
+ * `last_run_at` is the time of the most recent POST to
+ * `/v1/conversations` — used as the sort key on the conversations list.
+ * It is NOT derived from `replays.started_at`; the SDK orchestrator
+ * POSTs the conversation at the start of every run, which makes this a
+ * reasonable proxy for "last activity" in practice.
  *
  * Accepts either the top-level `StoreDb` or a transaction handle so a
  * caller can compose this with sibling inserts atomically — see
