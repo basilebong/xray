@@ -319,7 +319,7 @@ async function parseMultipartConversationBody(
 		audioBytesByKey.set(key, new Uint8Array(await value.arrayBuffer()));
 	}
 	if (specEntry === undefined) throw new MissingSpecPartError();
-	if (specEntry.length > MAX_CONVERSATION_BODY_BYTES) {
+	if (Buffer.byteLength(specEntry, "utf8") > MAX_CONVERSATION_BODY_BYTES) {
 		throw new ConversationBodyTooLargeError(MAX_CONVERSATION_BODY_BYTES);
 	}
 	try {

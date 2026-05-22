@@ -328,12 +328,31 @@ async def run(
                 turns=turn_records,
                 transcript=(runtime_result.full_transcript if runtime_result is not None else None),
             )
-            await _evaluate_judge(conversation.judge, replay_result)
+            # Judge is dev-authored Python — must not strand the replay row in
+            # a non-terminal state if it raises. Outcome is side-effected onto
+            # OTEL spans inside `_evaluate_judge`; the orchestrator's job is
+            # to still PATCH so the row reaches a terminal lifecycle.
+            try:
+                await _evaluate_judge(conversation.judge, replay_result)
+            except Exception:
+                logger.exception("judge raised for replay %s", replay_id)
 
         # 8. PATCH.
         patch_body = _build_patch_body(status=status, failure_reason=failure_reason)
         r = await client.patch(f"/v1/replays/{replay_id}", json=patch_body)
-        r.raise_for_status()
+        if r.status_code == 409:
+            # Server already owns the lifecycle — either still `analyzing`
+            # (SSE wait at step 4 didn't see the terminal event in time) or
+            # already terminal with a different `lifecycle_state` than we
+            # would have written. Server's truth wins; trying to force ours
+            # would mean re-fetching + re-PATCHing in a loop with no guarantee
+            # of convergence. Log and move on.
+            logger.info(
+                "PATCH /v1/replays/%s returned 409 — server owns lifecycle, accepting its state",
+                replay_id,
+            )
+        else:
+            _raise_for_status_typed(r, f"PATCH /v1/replays/{replay_id}")
 
         return RunResult(
             id=replay_id,

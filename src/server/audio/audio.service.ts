@@ -1,4 +1,5 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, extname, join, resolve, sep } from "node:path";
 
 import { eq } from "drizzle-orm";
@@ -36,8 +37,13 @@ const UPLOAD_ALLOWED_STATES: readonly ReplayLifecycleState[] = [
 
 /**
  * Save a recorded conversation-input audio file under a content-addressed
- * path (`recorded/<sha256>.wav`). Idempotent: same bytes ⇒ same file ⇒
- * `EEXIST` on the second write is the success signal, not a failure.
+ * path (`recorded/<sha256>.wav`). Idempotent: same bytes ⇒ same file.
+ *
+ * Writes to a per-call tmp file then `rename(2)` atomically into place, so
+ * a concurrent upload of the same content can never observe a half-written
+ * target (the previous `writeFile(flag: "wx")` strategy returned success to
+ * the loser while the winner was still streaming bytes — a partial-content
+ * window for readers).
  *
  * Returns the relative path under `audioRoot`. The caller is expected to
  * have already computed the sha256 from the bytes.
@@ -50,18 +56,15 @@ export async function saveRecordedConversationAudio(
 	const relativePath = recordedRelativePath(sha256);
 	const absolutePath = resolveInsideRoot(audioRoot, relativePath);
 	await mkdir(dirname(absolutePath), { recursive: true });
+	const tmpPath = `${absolutePath}.tmp-${randomUUID()}`;
 	try {
-		await writeFile(absolutePath, bytes, { flag: "wx" });
+		await writeFile(tmpPath, bytes);
+		await rename(tmpPath, absolutePath);
 	} catch (err) {
-		if (!isEexist(err)) throw err;
+		await rm(tmpPath, { force: true });
+		throw err;
 	}
 	return relativePath;
-}
-
-function isEexist(err: unknown): boolean {
-	if (!(err instanceof Error) || !("code" in err)) return false;
-	const code: unknown = err.code;
-	return code === "EEXIST";
 }
 
 function recordedRelativePath(sha256: string): string {

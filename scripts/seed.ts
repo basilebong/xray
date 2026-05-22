@@ -128,10 +128,9 @@ const TTS_VOICE_FOR_ROLE: Record<"user" | "agent", string> = {
 };
 
 async function main() {
-	let conversationHash = "";
+	const conversationHash = await postConversation();
 	for (let i = 0; i < REPLAY_COUNT; i++) {
-		const created = await postReplay(i);
-		conversationHash = created.conversationHash;
+		const created = await postReplay(conversationHash, i);
 		await pushOtlp(created.id, i, conversationHash);
 		await uploadReplayAudio(created.id, i);
 		await patchReplay(created.id, i);
@@ -141,27 +140,42 @@ async function main() {
 	);
 }
 
-async function postReplay(idx: number): Promise<{ id: string; conversationHash: string }> {
-	const spec = {
-		name: CONVERSATION_NAME,
-		turns: TURNS,
-		modality: "voice",
+async function postConversation(): Promise<string> {
+	const spec = { name: CONVERSATION_NAME, turns: TURNS };
+	const form = new FormData();
+	form.set("spec", JSON.stringify(spec));
+	const res = await fetch(`${BASE}/v1/conversations`, { method: "POST", body: form });
+	if (!res.ok) {
+		throw new SeedRequestError(
+			"POST",
+			"/v1/conversations",
+			res.status,
+			res.statusText,
+			await res.text(),
+		);
+	}
+	const parsed = v.parse(v.object({ hash: v.string() }), await res.json());
+	return parsed.hash;
+}
+
+async function postReplay(conversationHash: string, idx: number): Promise<{ id: string }> {
+	const body = {
+		conversation_hash: conversationHash,
 		run_config: {
 			model: idx % 2 === 0 ? "gpt-4o" : "gpt-4o-mini",
 			temperature: 0.3 + idx * 0.2,
 		},
 	};
-	const form = new FormData();
-	form.set("spec", JSON.stringify(spec));
-	const res = await fetch(`${BASE}/v1/replays`, { method: "POST", body: form });
+	const res = await fetch(`${BASE}/v1/replays`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
 	if (!res.ok) {
 		throw new SeedRequestError("POST", "/v1/replays", res.status, res.statusText, await res.text());
 	}
-	const parsed = v.parse(
-		v.object({ id: v.string(), conversation_hash: v.string() }),
-		await res.json(),
-	);
-	return { id: parsed.id, conversationHash: parsed.conversation_hash };
+	const parsed = v.parse(v.object({ id: v.string() }), await res.json());
+	return { id: parsed.id };
 }
 
 async function pushOtlp(replayId: string, idx: number, conversationHash: string) {
@@ -313,12 +327,9 @@ async function uploadReplayAudio(replayId: string, replayIdx: number) {
 
 async function patchReplay(replayId: string, idx: number) {
 	const body = {
-		status: idx === 2 ? "failed" : "completed",
-		failure_reason: idx === 2 ? "runtime_error" : null,
+		lifecycle_state: idx === 2 ? "failed" : "completed",
+		failure_reason: idx === 2 ? "driver_aborted" : null,
 		finished_at: new Date(Date.UTC(2026, 4, 18 + idx, 12, 0, 15)).toISOString(),
-		transcript: PLAYED.map((p) => `${p.role === "user" ? "User" : "Agent"}: ${p.transcript}`).join(
-			"\n",
-		),
 	};
 	const res = await fetch(`${BASE}/v1/replays/${replayId}`, {
 		method: "PATCH",
