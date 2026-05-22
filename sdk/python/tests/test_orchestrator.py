@@ -452,7 +452,8 @@ async def test_run_tolerates_409_on_final_patch():
     )
     patch_replay = respx.patch(f"http://xray.local/v1/replays/{replay_id}").mock(
         return_value=httpx.Response(
-            409, json={"error": "replay_lifecycle_transition", "from": "analyzing", "to": "completed"}
+            409,
+            json={"error": "replay_lifecycle_transition", "from": "analyzing", "to": "completed"},
         )
     )
 
