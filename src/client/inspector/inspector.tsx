@@ -136,8 +136,14 @@ function TurnsCard({ replay }: { replay: ReplayDetailResponse }) {
 					Turns
 				</CardTitle>
 			</CardHeader>
-			<CardContent>
+			<CardContent className="space-y-3">
 				<StereoTurnPlayer audioUrl={replayAudioUrl(replay.id)} turns={replay.turns} />
+				{replay.turns.length === 0 && (
+					<p className="text-xs text-muted-foreground">
+						Audio uploaded — server-side VAD analysis hasn't published turns yet. They'll appear on
+						the waveform once analysis completes.
+					</p>
+				)}
 			</CardContent>
 		</Card>
 	);

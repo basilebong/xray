@@ -5,6 +5,7 @@ import type WaveSurfer from "wavesurfer.js";
 import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
 
 import type { ReplayTurnResponse } from "@/client/api/api.types.ts";
+import { Badge } from "@/client/components/ui/badge.tsx";
 import { Button } from "@/client/components/ui/button.tsx";
 import { cn } from "@/client/lib/utils.ts";
 
@@ -12,16 +13,17 @@ import { cn } from "@/client/lib/utils.ts";
  * Hex / rgba color literals live INSIDE the wavesurfer config only — they
  * have to be CSS color strings the canvas renderer can consume, and Tailwind
  * tokens (oklch CSS variables) don't resolve through JS. The complementary
- * legend swatches in JSX use Tailwind utilities (`bg-sky-500`, `bg-orange-500`)
- * tuned to match these hex values.
+ * legend swatches in JSX use `bg-sky-400` / `bg-orange-400` — the same
+ * sky-400 / orange-400 we feed to the wavesurfer canvas below.
  */
 const USER_WAVE = "#38bdf8"; // sky-400
-const USER_PROGRESS = "#0284c7"; // sky-600
-const USER_REGION_FILL = "rgba(56, 189, 248, 0.16)";
 const AGENT_WAVE = "#fb923c"; // orange-400
-const AGENT_PROGRESS = "#ea580c"; // orange-600
+const USER_REGION_FILL = "rgba(56, 189, 248, 0.16)";
 const AGENT_REGION_FILL = "rgba(251, 146, 60, 0.18)";
-const CURSOR_COLOR = "#0f172a"; // slate-900
+// Progress color renders the already-played portion of each channel — a
+// translucent white turns it into a "frosted" overlay over the channel tone.
+const PROGRESS_COLOR = "rgba(255, 255, 255, 0.85)";
+const CURSOR_COLOR = "#ffffff";
 
 interface StereoTurnPlayerProps {
 	audioUrl: string;
@@ -48,8 +50,8 @@ export function StereoTurnPlayer({ audioUrl, turns, className }: StereoTurnPlaye
 	// instance on every render (the hook deps-array spreads option values).
 	const splitChannels = useMemo(
 		() => [
-			{ waveColor: USER_WAVE, progressColor: USER_PROGRESS },
-			{ waveColor: AGENT_WAVE, progressColor: AGENT_PROGRESS },
+			{ waveColor: USER_WAVE, progressColor: PROGRESS_COLOR },
+			{ waveColor: AGENT_WAVE, progressColor: PROGRESS_COLOR },
 		],
 		[],
 	);
@@ -59,7 +61,7 @@ export function StereoTurnPlayer({ audioUrl, turns, className }: StereoTurnPlaye
 		url: audioUrl,
 		height: 56,
 		waveColor: USER_WAVE,
-		progressColor: USER_PROGRESS,
+		progressColor: PROGRESS_COLOR,
 		cursorColor: CURSOR_COLOR,
 		cursorWidth: 2,
 		barWidth: 2,
@@ -70,7 +72,7 @@ export function StereoTurnPlayer({ audioUrl, turns, className }: StereoTurnPlaye
 		plugins,
 	});
 
-	const duration = useDuration(wavesurfer);
+	const { duration, loadError } = useWaveState(wavesurfer);
 
 	// Refresh regions when audio loads or the turns prop changes. clearRegions
 	// is a no-op pre-load, so guarding on isReady avoids drawing regions onto
@@ -81,10 +83,9 @@ export function StereoTurnPlayer({ audioUrl, turns, className }: StereoTurnPlaye
 		for (const turn of turns) {
 			regions.addRegion({
 				id: `turn-${turn.idx}-${turn.role}`,
-				start: turn.voice_start_ms / 1000,
-				end: turn.voice_end_ms / 1000,
+				start: turn.turn_start_ms / 1000,
+				end: turn.turn_end_ms / 1000,
 				color: turn.role === "user" ? USER_REGION_FILL : AGENT_REGION_FILL,
-				content: turn.role,
 				drag: false,
 				resize: false,
 				channelIdx: turn.role === "user" ? 0 : 1,
@@ -110,17 +111,37 @@ export function StereoTurnPlayer({ audioUrl, turns, className }: StereoTurnPlaye
 			<div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-sky-400/70 via-transparent to-orange-400/70" />
 
 			<div className="flex items-center justify-between gap-4 px-5 pt-4 pb-3">
-				<div className="flex items-center gap-3">
-					<ChannelChip tone="user" />
-					<ChannelChip tone="agent" />
+				<div className="flex items-center gap-2">
+					<Badge variant="outline" className="gap-1.5 lowercase tracking-wide">
+						<span
+							aria-hidden="true"
+							className="size-2 rounded-full bg-sky-400 ring-2 ring-sky-400/30"
+						/>
+						user
+					</Badge>
+					<Badge variant="outline" className="gap-1.5 lowercase tracking-wide">
+						<span
+							aria-hidden="true"
+							className="size-2 rounded-full bg-orange-400 ring-2 ring-orange-400/30"
+						/>
+						agent
+					</Badge>
 				</div>
 				<span className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-					Stereo · {turns.length} turns
+					Stereo · {turns.length} {turns.length === 1 ? "turn" : "turns"}
 				</span>
 			</div>
 
-			<section className="px-2 pb-1" aria-label="Replay waveform">
+			<section className="relative px-2 pb-1" aria-label="Replay waveform">
 				<div ref={containerRef} className="w-full" />
+				{loadError !== null && (
+					<p
+						role="alert"
+						className="absolute inset-0 flex items-center justify-center bg-card/80 text-xs text-destructive backdrop-blur-sm"
+					>
+						Couldn't load audio. {loadError}
+					</p>
+				)}
 			</section>
 
 			<div className="flex items-center gap-4 border-t border-border/50 bg-muted/30 px-5 py-3">
@@ -139,46 +160,48 @@ export function StereoTurnPlayer({ audioUrl, turns, className }: StereoTurnPlaye
 					<span className="text-foreground">{formatClock(currentTime)}</span>
 					<span className="text-muted-foreground"> / {formatClock(duration)}</span>
 				</div>
-				<div className="ml-auto text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-					{isReady ? "ready" : "loading"}
-				</div>
 			</div>
 		</div>
 	);
 }
 
-function ChannelChip({ tone }: { tone: "user" | "agent" }) {
-	const isUser = tone === "user";
-	return (
-		<span className="inline-flex items-center gap-1.5 rounded-full border border-border/60 bg-background/70 px-2.5 py-1 text-[11px] font-medium tabular-nums">
-			<span
-				aria-hidden="true"
-				className={cn(
-					"size-2 rounded-full",
-					isUser ? "bg-sky-400 ring-2 ring-sky-400/30" : "bg-orange-400 ring-2 ring-orange-400/30",
-				)}
-			/>
-			<span className="lowercase tracking-wide text-foreground/80">{tone}</span>
-		</span>
-	);
-}
-
 /**
- * Wavesurfer's `getDuration()` reads the active media element, so it only
- * becomes non-zero after the "ready" event fires. We track it as state so
- * the time readout re-renders the first time it's known.
+ * Track the two pieces of wavesurfer state the hook doesn't expose:
+ *   - `duration` — `getDuration()` only returns non-zero after "ready", so
+ *      we sync via the "ready" event.
+ *   - `loadError` — when the fetch / decode fails, "ready" never fires and
+ *     `isReady` stays false forever; without this we'd render a permanently
+ *     disabled player with no feedback. The "error" payload from wavesurfer
+ *     is `unknown` (Event | Error | string); we surface the human-readable
+ *     part and let CSS overlay the error message on the empty canvas.
  */
-function useDuration(wavesurfer: WaveSurfer | null): number {
+function useWaveState(wavesurfer: WaveSurfer | null): {
+	duration: number;
+	loadError: string | null;
+} {
 	const [duration, setDuration] = useState(0);
+	const [loadError, setLoadError] = useState<string | null>(null);
 	useEffect(() => {
 		if (!wavesurfer) {
 			setDuration(0);
+			setLoadError(null);
 			return;
 		}
 		setDuration(wavesurfer.getDuration());
-		return wavesurfer.on("ready", () => setDuration(wavesurfer.getDuration()));
+		setLoadError(null);
+		const offReady = wavesurfer.on("ready", () => {
+			setDuration(wavesurfer.getDuration());
+			setLoadError(null);
+		});
+		const offError = wavesurfer.on("error", (err: unknown) => {
+			setLoadError(err instanceof Error ? err.message : String(err));
+		});
+		return () => {
+			offReady();
+			offError();
+		};
 	}, [wavesurfer]);
-	return duration;
+	return { duration, loadError };
 }
 
 function formatClock(seconds: number): string {
