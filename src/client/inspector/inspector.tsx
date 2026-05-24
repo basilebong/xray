@@ -144,13 +144,13 @@ function ReplayBody({ replay }: { replay: ReplayDetailResponse }) {
 function TurnsCard({ replay }: { replay: ReplayDetailResponse }) {
 	if (replay.audio_path === null) {
 		return (
-			<Card className="gap-4">
-				<CardHeader>
+			<Card className="gap-0 overflow-hidden p-0">
+				<CardHeader className="gap-0 border-b-[1px] border-border/60 px-5 py-4">
 					<CardTitle className="text-base font-semibold tracking-tight text-foreground">
 						Turns
 					</CardTitle>
 				</CardHeader>
-				<CardContent>
+				<CardContent className="px-5 py-4">
 					<p className="text-sm text-muted-foreground">
 						Awaiting audio upload. Server-side VAD analysis populates turns after the stereo WAV
 						lands.
@@ -160,13 +160,13 @@ function TurnsCard({ replay }: { replay: ReplayDetailResponse }) {
 		);
 	}
 	return (
-		<Card className="gap-4">
-			<CardHeader>
+		<Card className="gap-0 overflow-hidden p-0">
+			<CardHeader className="gap-0 border-b-[1px] border-border/60 px-5 py-4">
 				<CardTitle className="text-base font-semibold tracking-tight text-foreground">
 					Turns
 				</CardTitle>
 			</CardHeader>
-			<CardContent className="space-y-3">
+			<CardContent className="space-y-3 px-5 py-4">
 				<StereoTurnPlayer audioUrl={replayAudioUrl(replay.id)} turns={replay.turns} />
 				{replay.turns.length === 0 && (
 					<p className="text-xs text-muted-foreground">
@@ -181,13 +181,13 @@ function TurnsCard({ replay }: { replay: ReplayDetailResponse }) {
 
 function SpansCard({ spans }: { spans: SpanResponse[] }) {
 	return (
-		<Card className="gap-4">
-			<CardHeader>
+		<Card className="gap-0 overflow-hidden p-0">
+			<CardHeader className="gap-0 border-b-[1px] border-border/60 px-5 py-4">
 				<CardTitle className="text-base font-semibold tracking-tight text-foreground">
 					Span tree
 				</CardTitle>
 			</CardHeader>
-			<CardContent>
+			<CardContent className="px-5 py-4">
 				{spans.length === 0 ? (
 					<p className="text-sm text-muted-foreground">
 						No trace spans recorded. Decorate your agent code with{" "}
@@ -236,7 +236,7 @@ function RunDetailsCard({ replay }: { replay: ReplayDetailResponse }) {
 	if (!hasUsage && !hasTools && !hasConfig) return null;
 	return (
 		<Card className="gap-0 overflow-hidden p-0">
-			<CardHeader className="border-b border-border/60 px-5 py-4">
+			<CardHeader className="gap-0 border-b-[1px] border-border/60 px-5 py-4">
 				<CardTitle className="text-base font-semibold tracking-tight text-foreground">
 					Run details
 				</CardTitle>
@@ -358,18 +358,10 @@ function ToolCallsSection({ toolCalls }: { toolCalls: ToolCallResponse[] }) {
 							)}
 						</div>
 						{(tc.args_json !== null || tc.result_json !== null) && (
-							<dl className="mt-1 space-y-0.5 border-l border-border/40 pl-2.5 text-[11px] text-muted-foreground">
-								{tc.args_json !== null && (
-									<div className="flex gap-2">
-										<dt className="shrink-0 text-muted-foreground/60">args</dt>
-										<dd className="min-w-0 truncate text-foreground/80">{tc.args_json}</dd>
-									</div>
-								)}
+							<dl className="mt-1 space-y-1 border-l border-border/40 pl-2.5 text-[11px] text-muted-foreground">
+								{tc.args_json !== null && <ToolCallJsonField label="Args" raw={tc.args_json} />}
 								{tc.result_json !== null && (
-									<div className="flex gap-2">
-										<dt className="shrink-0 text-muted-foreground/60">↳</dt>
-										<dd className="min-w-0 truncate text-foreground/80">{tc.result_json}</dd>
-									</div>
+									<ToolCallJsonField label="Result" raw={tc.result_json} />
 								)}
 							</dl>
 						)}
@@ -378,6 +370,39 @@ function ToolCallsSection({ toolCalls }: { toolCalls: ToolCallResponse[] }) {
 			</ul>
 		</section>
 	);
+}
+
+function ToolCallJsonField({ label, raw }: { label: string; raw: string }) {
+	const parsed = safeParseJson(raw);
+	if (parsed.ok && isJsonContainer(parsed.value)) {
+		return (
+			<div className="flex gap-2">
+				<dt className="shrink-0 text-muted-foreground/60">{label}</dt>
+				<dd className="min-w-0 flex-1 overflow-auto">
+					<JsonView
+						data={parsed.value}
+						style={JSON_VIEW_STYLE}
+						shouldExpandNode={(level) => level < 1}
+					/>
+				</dd>
+			</div>
+		);
+	}
+	return (
+		<div className="flex gap-2">
+			<dt className="shrink-0 text-muted-foreground/60">{label}</dt>
+			<dd className="min-w-0 truncate text-foreground/80">{raw}</dd>
+		</div>
+	);
+}
+
+function safeParseJson(raw: string): { ok: true; value: unknown } | { ok: false } {
+	try {
+		const value: unknown = JSON.parse(raw);
+		return { ok: true, value };
+	} catch {
+		return { ok: false };
+	}
 }
 
 function RunConfigSection({ runConfig }: { runConfig: unknown }) {

@@ -67,12 +67,12 @@ describe("Inspector empty states", () => {
 		expect(empty.textContent).toMatch(/docs\/SDK\.md/);
 	});
 
-	it("explains that VAD populates the Turns card when none have been derived", async () => {
+	it("explains that VAD will populate the Turns card before audio is uploaded", async () => {
 		mockReplay(buildReplay({ turns: [] }));
 		const { ui } = renderWithRouter({ initialEntries: [`/replays/${REPLAY_ID}`] });
 		render(ui);
 
-		const empty = await waitFor(() => screen.getByText(/No turns derived yet/i));
+		const empty = await waitFor(() => screen.getByText(/Awaiting audio upload/i));
 		expect(empty.textContent).toMatch(/VAD analysis/);
 	});
 });
@@ -88,10 +88,11 @@ describe("Inspector header", () => {
 	});
 });
 
-describe("Inspector TurnBlock", () => {
-	it("renders each turn's role, idx, and VAD voice ms range formatted as seconds", async () => {
+describe("Inspector TurnsCard", () => {
+	it("renders the stereo player with the turn count when audio has been uploaded", async () => {
 		mockReplay(
 			buildReplay({
+				audio_path: "/data/audio/replay.wav",
 				turns: [
 					{
 						idx: 0,
@@ -115,21 +116,6 @@ describe("Inspector TurnBlock", () => {
 		const { ui } = renderWithRouter({ initialEntries: [`/replays/${REPLAY_ID}`] });
 		render(ui);
 
-		const items = await waitFor(() => {
-			const list = screen.getByText("Turns").closest("[data-slot='card']");
-			if (list === null) throw new Error("Turns card not rendered yet");
-			return list.querySelectorAll("ol > li");
-		});
-		expect(items.length).toBe(2);
-
-		const first = items[0];
-		expect(first?.textContent).toMatch(/user/);
-		expect(first?.textContent).toMatch(/#0/);
-		expect(first?.textContent).toMatch(/0\.12s → 2\.38s/);
-
-		const second = items[1];
-		expect(second?.textContent).toMatch(/agent/);
-		expect(second?.textContent).toMatch(/#1/);
-		expect(second?.textContent).toMatch(/3\.05s → 6\.45s/);
+		await waitFor(() => screen.getByText(/Stereo · 2 turns/i));
 	});
 });
