@@ -1,5 +1,7 @@
 import { skipToken, useQuery } from "@tanstack/react-query";
 import { useParams } from "@tanstack/react-router";
+import type { StyleProps } from "react-json-view-lite";
+import { JsonView } from "react-json-view-lite";
 import { match } from "ts-pattern";
 
 import { BackLink } from "@/client/components/back-link.tsx";
@@ -7,7 +9,17 @@ import { Breadcrumbs } from "@/client/components/breadcrumbs.tsx";
 import { Badge } from "@/client/components/ui/badge.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "@/client/components/ui/card.tsx";
 import { Skeleton } from "@/client/components/ui/skeleton.tsx";
+import {
+	Table,
+	TableBody,
+	TableCell,
+	TableFooter,
+	TableHead,
+	TableHeader,
+	TableRow,
+} from "@/client/components/ui/table.tsx";
 import { shortHash } from "@/client/format.ts";
+import { cn } from "@/client/lib/utils.ts";
 
 import { getConversation, getReplay, replayAudioUrl } from "../api/api.ts";
 import type {
@@ -123,9 +135,7 @@ function ReplayBody({ replay }: { replay: ReplayDetailResponse }) {
 				<SpansCard spans={replay.spans} />
 			</div>
 			<aside className="grid gap-6">
-				<RunConfigCard replay={replay} />
-				<ToolCallsCard toolCalls={replay.tool_calls} />
-				<ModelUsageCard usage={replay.model_usage} />
+				<RunDetailsCard replay={replay} />
 			</aside>
 		</div>
 	);
@@ -136,7 +146,7 @@ function TurnsCard({ replay }: { replay: ReplayDetailResponse }) {
 		return (
 			<Card className="gap-4">
 				<CardHeader>
-					<CardTitle className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
+					<CardTitle className="text-base font-semibold tracking-tight text-foreground">
 						Turns
 					</CardTitle>
 				</CardHeader>
@@ -152,7 +162,7 @@ function TurnsCard({ replay }: { replay: ReplayDetailResponse }) {
 	return (
 		<Card className="gap-4">
 			<CardHeader>
-				<CardTitle className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
+				<CardTitle className="text-base font-semibold tracking-tight text-foreground">
 					Turns
 				</CardTitle>
 			</CardHeader>
@@ -173,7 +183,7 @@ function SpansCard({ spans }: { spans: SpanResponse[] }) {
 	return (
 		<Card className="gap-4">
 			<CardHeader>
-				<CardTitle className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
+				<CardTitle className="text-base font-semibold tracking-tight text-foreground">
 					Span tree
 				</CardTitle>
 			</CardHeader>
@@ -211,85 +221,211 @@ function SpansCard({ spans }: { spans: SpanResponse[] }) {
 	);
 }
 
-function RunConfigCard({ replay }: { replay: ReplayDetailResponse }) {
-	if (replay.run_config === null || replay.run_config === undefined) return null;
+/**
+ * One sidebar panel that consolidates the three "metadata" cards the
+ * inspector used to stack: model usage, tool calls, and the raw run-config
+ * JSON. The aesthetic is a single data sheet — sections divided by hairline
+ * rules instead of card chrome, mono uppercase micro-labels, dense type.
+ * Each section omits itself when empty; the whole card disappears when
+ * nothing has data.
+ */
+function RunDetailsCard({ replay }: { replay: ReplayDetailResponse }) {
+	const hasUsage = replay.model_usage.length > 0;
+	const hasTools = replay.tool_calls.length > 0;
+	const hasConfig = replay.run_config !== null && replay.run_config !== undefined;
+	if (!hasUsage && !hasTools && !hasConfig) return null;
 	return (
-		<Card className="gap-4">
-			<CardHeader>
-				<CardTitle className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
-					Run config
+		<Card className="gap-0 overflow-hidden p-0">
+			<CardHeader className="border-b border-border/60 px-5 py-4">
+				<CardTitle className="text-base font-semibold tracking-tight text-foreground">
+					Run details
 				</CardTitle>
 			</CardHeader>
-			<CardContent>
-				<pre className="overflow-auto whitespace-pre-wrap break-all rounded-md border border-border/60 bg-muted/20 p-3 font-mono text-xs leading-relaxed">
-					{JSON.stringify(replay.run_config, null, 2)}
-				</pre>
+			<CardContent className="divide-y divide-border/50 p-0">
+				{hasUsage && <ModelUsageSection usage={replay.model_usage} />}
+				{hasTools && <ToolCallsSection toolCalls={replay.tool_calls} />}
+				{hasConfig && <RunConfigSection runConfig={replay.run_config} />}
 			</CardContent>
 		</Card>
 	);
 }
 
-function ToolCallsCard({ toolCalls }: { toolCalls: ToolCallResponse[] }) {
-	if (toolCalls.length === 0) return null;
+function SectionHeader({ label, meta }: { label: string; meta?: string | null }) {
 	return (
-		<Card className="gap-4">
-			<CardHeader>
-				<CardTitle className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
-					Tool calls
-				</CardTitle>
-			</CardHeader>
-			<CardContent>
-				<ul className="grid gap-2 text-xs">
-					{toolCalls.map((tc) => (
-						<li
-							key={tc.id}
-							className="rounded-md border border-border/60 bg-muted/20 p-2.5 font-mono"
-						>
-							<div className="font-medium">{tc.name}</div>
-							{tc.args_json !== null && (
-								<div className="mt-1 truncate text-muted-foreground">args: {tc.args_json}</div>
-							)}
-							{tc.result_json !== null && (
-								<div className="truncate text-muted-foreground">result: {tc.result_json}</div>
-							)}
-							{tc.latency_ms !== null && (
-								<div className="text-muted-foreground tabular-nums">{tc.latency_ms}ms</div>
-							)}
-						</li>
-					))}
-				</ul>
-			</CardContent>
-		</Card>
+		<div className="mb-3 flex items-baseline justify-between gap-3">
+			<h3 className="font-mono text-[10px] font-medium uppercase tracking-[0.22em] text-foreground/70">
+				{label}
+			</h3>
+			{meta !== null && meta !== undefined && (
+				<span className="font-mono text-[10px] tracking-wide text-muted-foreground/70 tabular-nums">
+					{meta}
+				</span>
+			)}
+		</div>
 	);
 }
 
-function ModelUsageCard({ usage }: { usage: ModelUsageResponse[] }) {
-	if (usage.length === 0) return null;
+function ModelUsageSection({ usage }: { usage: ModelUsageResponse[] }) {
+	const totals = usage.reduce(
+		(acc, u) => ({
+			input: acc.input + (u.input_tokens ?? 0),
+			output: acc.output + (u.output_tokens ?? 0),
+			total: acc.total + (u.total_tokens ?? 0),
+		}),
+		{ input: 0, output: 0, total: 0 },
+	);
+	const showTotalRow = usage.length > 1;
 	return (
-		<Card className="gap-4">
-			<CardHeader>
-				<CardTitle className="text-sm font-medium uppercase tracking-wider text-muted-foreground">
-					Model usage
-				</CardTitle>
-			</CardHeader>
-			<CardContent>
-				<ul className="grid gap-2 text-xs">
+		<section className="px-5 py-4">
+			<SectionHeader
+				label="Model usage"
+				meta={`${usage.length} call${usage.length === 1 ? "" : "s"}`}
+			/>
+			<Table className="w-full table-fixed font-mono text-xs tabular-nums">
+				<TableHeader>
+					<TableRow className="hover:bg-transparent">
+						<TableHead className={cn(USAGE_HEAD, "pl-0")}>model</TableHead>
+						<TableHead className={cn(USAGE_HEAD, "w-12 text-right")}>in</TableHead>
+						<TableHead className={cn(USAGE_HEAD, "w-12 text-right")}>out</TableHead>
+						<TableHead className={cn(USAGE_HEAD, "w-14 pr-0 text-right")}>total</TableHead>
+					</TableRow>
+				</TableHeader>
+				<TableBody>
 					{usage.map((u) => (
-						<li key={u.id} className="rounded-md border border-border/60 bg-muted/20 p-2.5">
-							<div className="flex items-center justify-between gap-2">
-								<span className="font-mono">{u.model ?? "(unknown)"}</span>
-								<Badge variant="outline" className="font-normal">
-									{u.provider ?? "?"}
-								</Badge>
-							</div>
-							<div className="mt-1 text-muted-foreground tabular-nums">
-								in: {u.input_tokens ?? "?"} · out: {u.output_tokens ?? "?"} · total:{" "}
-								{u.total_tokens ?? "?"}
-							</div>
-						</li>
+						<TableRow key={u.id} className="border-border/40">
+							<TableCell className="overflow-hidden pl-0">
+								<div className="truncate">
+									<span className="text-foreground">{u.model ?? "—"}</span>
+									{u.provider !== null && (
+										<span className="ml-1.5 text-muted-foreground">/{u.provider}</span>
+									)}
+								</div>
+							</TableCell>
+							<TableCell className="text-right text-foreground/80">
+								{formatTokens(u.input_tokens)}
+							</TableCell>
+							<TableCell className="text-right text-foreground/80">
+								{formatTokens(u.output_tokens)}
+							</TableCell>
+							<TableCell className="pr-0 text-right font-semibold text-foreground">
+								{formatTokens(u.total_tokens)}
+							</TableCell>
+						</TableRow>
 					))}
-				</ul>
-			</CardContent>
-		</Card>
+				</TableBody>
+				{showTotalRow && (
+					<TableFooter className="bg-transparent">
+						<TableRow className="border-t border-border/40 hover:bg-transparent">
+							<TableCell className="pl-0 text-[10px] uppercase tracking-wider text-muted-foreground">
+								Total
+							</TableCell>
+							<TableCell className="text-right text-foreground/80">
+								{totals.input.toLocaleString()}
+							</TableCell>
+							<TableCell className="text-right text-foreground/80">
+								{totals.output.toLocaleString()}
+							</TableCell>
+							<TableCell className="pr-0 text-right text-foreground">
+								{totals.total.toLocaleString()}
+							</TableCell>
+						</TableRow>
+					</TableFooter>
+				)}
+			</Table>
+		</section>
 	);
 }
+
+const USAGE_HEAD = "h-7 text-[10px] uppercase tracking-wider text-muted-foreground/70 font-normal";
+
+function formatTokens(value: number | null): string {
+	return value === null ? "—" : value.toLocaleString();
+}
+
+function ToolCallsSection({ toolCalls }: { toolCalls: ToolCallResponse[] }) {
+	return (
+		<section className="px-5 py-4">
+			<SectionHeader label="Tool calls" meta={`${toolCalls.length}`} />
+			<ul className="space-y-2.5">
+				{toolCalls.map((tc) => (
+					<li key={tc.id} className="font-mono text-xs">
+						<div className="flex items-baseline justify-between gap-3">
+							<span className="truncate font-medium text-foreground">{tc.name}</span>
+							{tc.latency_ms !== null && (
+								<span className="shrink-0 tabular-nums text-muted-foreground">
+									{tc.latency_ms}ms
+								</span>
+							)}
+						</div>
+						{(tc.args_json !== null || tc.result_json !== null) && (
+							<dl className="mt-1 space-y-0.5 border-l border-border/40 pl-2.5 text-[11px] text-muted-foreground">
+								{tc.args_json !== null && (
+									<div className="flex gap-2">
+										<dt className="shrink-0 text-muted-foreground/60">args</dt>
+										<dd className="min-w-0 truncate text-foreground/80">{tc.args_json}</dd>
+									</div>
+								)}
+								{tc.result_json !== null && (
+									<div className="flex gap-2">
+										<dt className="shrink-0 text-muted-foreground/60">↳</dt>
+										<dd className="min-w-0 truncate text-foreground/80">{tc.result_json}</dd>
+									</div>
+								)}
+							</dl>
+						)}
+					</li>
+				))}
+			</ul>
+		</section>
+	);
+}
+
+function RunConfigSection({ runConfig }: { runConfig: unknown }) {
+	return (
+		<section className="px-5 py-4">
+			<SectionHeader label="Run config" />
+			{isJsonContainer(runConfig) ? (
+				<div className="max-h-64 overflow-auto rounded-md border border-border/40 bg-muted/30 p-3">
+					<JsonView
+						data={runConfig}
+						style={JSON_VIEW_STYLE}
+						shouldExpandNode={(level) => level < 2}
+					/>
+				</div>
+			) : (
+				<pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-md border border-border/40 bg-muted/30 p-3 font-mono text-[11px] leading-relaxed text-foreground/90">
+					{JSON.stringify(runConfig)}
+				</pre>
+			)}
+		</section>
+	);
+}
+
+function isJsonContainer(value: unknown): value is object {
+	return typeof value === "object" && value !== null;
+}
+
+/**
+ * Style props for `react-json-view-lite`. Built entirely with our Tailwind
+ * tokens so we don't have to import the library's bundled CSS (the package
+ * ships hashed class names that would collide with our design system).
+ */
+const JSON_VIEW_STYLE: StyleProps = {
+	container: "font-mono text-[11px] leading-relaxed text-foreground/90",
+	basicChildStyle: "ml-3",
+	label: "mr-1.5 text-sky-400",
+	clickableLabel: "mr-1.5 cursor-pointer text-sky-400",
+	nullValue: "text-destructive",
+	undefinedValue: "text-destructive",
+	numberValue: "text-orange-400",
+	stringValue: "text-emerald-400",
+	booleanValue: "text-orange-400",
+	otherValue: "text-foreground",
+	punctuation: "mr-1 text-muted-foreground/60",
+	expandIcon: "mr-1 inline-block w-3 select-none text-muted-foreground before:content-['▸']",
+	collapseIcon: "mr-1 inline-block w-3 select-none text-muted-foreground before:content-['▾']",
+	collapsedContent: "mx-1 text-muted-foreground/60 before:content-['…']",
+	childFieldsContainer: "ml-1 border-l border-border/30 pl-2",
+	ariaLables: { collapseJson: "Collapse", expandJson: "Expand" },
+	stringifyStringValues: false,
+};
