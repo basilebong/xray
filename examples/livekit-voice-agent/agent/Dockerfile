@@ -13,7 +13,10 @@ WORKDIR /workspace
 COPY sdk/python /workspace/sdk/python
 RUN pip install --upgrade pip && \
     pip install -e "/workspace/sdk/python[livekit]" && \
-    pip install "livekit-agents>=1.5,<2" "livekit-plugins-google>=1.5,<2" "langfuse>=3,<4"
+    pip install \
+      "livekit-agents==1.5.9" \
+      "livekit-plugins-google==1.5.9" \
+      "langfuse==3.9.3"
 
 COPY examples/livekit-voice-agent/agent /workspace/agent
 

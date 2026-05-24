@@ -33,10 +33,6 @@ async def entrypoint(ctx: JobContext) -> None:
             llm=google.realtime.RealtimeModel(
                 model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"),
                 voice="Puck",
-                instructions=(
-                    "You are a friendly voice assistant. Greet the caller, then "
-                    "answer their question briefly in one or two sentences."
-                ),
                 output_audio_transcription=genai_types.AudioTranscriptionConfig(),
                 input_audio_transcription=genai_types.AudioTranscriptionConfig(),
             ),
@@ -54,34 +50,45 @@ async def entrypoint(ctx: JobContext) -> None:
                 return
             asyncio.create_task(_publish_agent_transcript(ctx.room, text))
 
-        await session.start(agent=Agent(instructions=""), room=ctx.room)
-
-        model_id = os.environ.get(
-            "GEMINI_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"
-        )
-
-        with _tracer.start_as_current_span("xray.stage.tts") as span:
-            span.set_attribute("xray.stage.tts.provider", "gemini-live")
-            span.set_attribute("xray.stage.tts.model", model_id)
-            # Gemini Live waits for user audio by default; kick off greeting.
-            session.generate_reply(
-                instructions="Greet the caller in one short sentence."
-            )
-
-        _langfuse_step(model_id)
-
-        if xray_session is not None:
-            xray_session.record_tool_call(
-                name="get_current_year",
-                args_json="{}",
-                result_json='{"year": 2026}',
-                latency_ms=5,
-            )
-
-        # Hold open until disconnect so xray.attach's force-flush has spans to flush.
         disconnect = asyncio.Event()
         ctx.room.on("disconnected", lambda *_: disconnect.set())
-        await disconnect.wait()
+
+        try:
+            await session.start(
+                agent=Agent(
+                    instructions=(
+                        "You are a friendly voice assistant. Greet the caller, then "
+                        "answer their question briefly in one or two sentences."
+                    ),
+                ),
+                room=ctx.room,
+            )
+
+            model_id = os.environ.get(
+                "GEMINI_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"
+            )
+
+            with _tracer.start_as_current_span("xray.stage.tts") as span:
+                span.set_attribute("xray.stage.tts.provider", "gemini-live")
+                span.set_attribute("xray.stage.tts.model", model_id)
+                handle = session.generate_reply(
+                    instructions="Greet the caller in one short sentence."
+                )
+                await handle
+
+            _langfuse_step(model_id)
+
+            if xray_session is not None:
+                xray_session.record_tool_call(
+                    name="get_current_year",
+                    args_json="{}",
+                    result_json='{"year": 2026}',
+                    latency_ms=5,
+                )
+
+            await disconnect.wait()
+        finally:
+            disconnect.set()
 
 
 async def _publish_agent_transcript(room: rtc.Room, text: str) -> None:

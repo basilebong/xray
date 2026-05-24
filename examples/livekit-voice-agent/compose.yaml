@@ -59,7 +59,7 @@ services:
       LIVEKIT_API_KEY: "devkey"
       LIVEKIT_API_SECRET: "devsecret32charsminimumlengthxyz123"
       XRAY_OTLP_ENDPOINT: "http://xray:8080"
-      GOOGLE_API_KEY: "${GEMINI_API_KEY:-}"
+      GOOGLE_API_KEY: "${GEMINI_API_KEY:?GEMINI_API_KEY must be set in examples/livekit-voice-agent/.env}"
       # Langfuse v3 refuses to init `@observe` without keys; fake values + non-routable
       # host let spans emit locally while skipping the cloud upload.
       LANGFUSE_PUBLIC_KEY: "pk-lf-example-public-key"

@@ -16,14 +16,19 @@ end-to-end. Demonstrates the one-line `xray.attach(ctx)` integration.
 ## Quickstart
 
 ```bash
+cd examples/livekit-voice-agent
+
 # 1. Get a Gemini API key — https://aistudio.google.com/app/apikey
 cp .env.example .env
 # edit .env, set GEMINI_API_KEY=...
 
-# 2. Boot livekit + xray + agent
+# 2. Boot livekit + xray + agent (streams logs — keep this shell open and
+#    wait for "registered worker" before moving on).
 docker compose up --build
 
-# 3. In another shell — drive one Replay
+# 3. In another shell — drive one Replay. The driver lives under a
+#    `test` profile so `compose up` doesn't auto-run it; this command
+#    opts in explicitly.
 docker compose --profile test run --rm driver
 
 # 4. Open the inspector — http://localhost:8080
@@ -41,4 +46,4 @@ async def entrypoint(ctx: JobContext) -> None:
         ...
 ```
 
-See `docs/integrate.md` for the deep-dive.
+See [docs/integrate.md](../../docs/integrate.md) for the deep-dive.

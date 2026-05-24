@@ -12,7 +12,10 @@ WORKDIR /workspace
 COPY sdk/python /workspace/sdk/python
 RUN pip install --upgrade pip && \
     pip install -e "/workspace/sdk/python[livekit]" && \
-    pip install "pytest>=8.0" "pytest-asyncio>=0.24" "httpx>=0.27"
+    pip install \
+      "pytest==8.4.2" \
+      "pytest-asyncio==1.3.0" \
+      "httpx==0.28.1"
 
 COPY examples/livekit-voice-agent/driver /workspace/driver
 COPY examples/livekit-voice-agent/fixtures /workspace/fixtures
