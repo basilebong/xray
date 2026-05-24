@@ -13,7 +13,7 @@ COPY sdk/python /workspace/sdk/python
 RUN pip install --upgrade pip && \
     pip install -e "/workspace/sdk/python[livekit]" && \
     pip install \
-      "pytest==8.4.2" \
+      "pytest==9.0.3" \
       "pytest-asyncio==1.3.0" \
       "httpx==0.28.1"
 
