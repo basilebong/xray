@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -12,7 +13,7 @@ from google.genai import types as genai_types
 from langfuse import observe
 from livekit import rtc
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
-from livekit.agents.llm import ChatMessage
+from livekit.agents.llm import ChatMessage, function_tool
 from livekit.agents.voice.events import ConversationItemAddedEvent
 from livekit.plugins import google
 from opentelemetry import trace
@@ -24,6 +25,19 @@ _tracer = trace.get_tracer("example-voice-agent")
 @observe(as_type="generation", name="example_langfuse_step")
 def _langfuse_step(model: str) -> str:
     return f"agent will use {model}"
+
+
+@function_tool
+async def get_current_year() -> dict[str, int]:
+    """Return the current calendar year. Call this whenever the user asks
+    about today's year, the current year, or what year it is."""
+    with _tracer.start_as_current_span("execute_tool") as span:
+        span.set_attribute("gen_ai.operation.name", "execute_tool")
+        span.set_attribute("gen_ai.tool.name", "get_current_year")
+        span.set_attribute("gen_ai.tool.arguments", "{}")
+        result = {"year": 2026}
+        span.set_attribute("gen_ai.tool.result", json.dumps(result))
+        return result
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -58,8 +72,12 @@ async def entrypoint(ctx: JobContext) -> None:
                 agent=Agent(
                     instructions=(
                         "You are a friendly voice assistant. Greet the caller, then "
-                        "answer their question briefly in one or two sentences."
+                        "answer their question briefly in one or two sentences. "
+                        "If the caller asks about the current year (or any "
+                        "question whose answer depends on the current year), you "
+                        "MUST call the `get_current_year` tool and use its result."
                     ),
+                    tools=[get_current_year],
                 ),
                 room=ctx.room,
             )
@@ -77,14 +95,6 @@ async def entrypoint(ctx: JobContext) -> None:
                 await handle
 
             _langfuse_step(model_id)
-
-            if xray_session is not None:
-                xray_session.record_tool_call(
-                    name="get_current_year",
-                    args_json="{}",
-                    result_json='{"year": 2026}',
-                    latency_ms=5,
-                )
 
             await disconnect.wait()
         finally:
