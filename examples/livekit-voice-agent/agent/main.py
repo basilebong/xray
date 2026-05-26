@@ -7,8 +7,12 @@ import json
 import logging
 import os
 import time
+import wave
+from collections.abc import AsyncIterable
+from pathlib import Path
 
 import xray
+from google import genai
 from google.genai import types as genai_types
 from langfuse import observe
 from livekit import rtc
@@ -20,6 +24,19 @@ from opentelemetry import trace
 
 logger = logging.getLogger("voice-agent")
 _tracer = trace.get_tracer("example-voice-agent")
+
+# Gemini 3.1 Live's `generate_reply()` is warn-and-ignored by the
+# realtime plugin, so the agent can't speak first via the LLM path.
+# Instead, synthesize the greeting once via Gemini's standalone TTS
+# model and publish the resulting PCM through `session.say(audio=...)`.
+# `add_to_chat_ctx=True` (the default) records the greeting text in
+# the chat history so the realtime model knows it already greeted.
+_GREETING_TEXT = "Hello there! How can I help you today?"
+_GREETING_VOICE = "Puck"
+_GREETING_TTS_MODEL = "gemini-2.5-flash-preview-tts"
+# Gemini standalone TTS returns 24kHz signed-16 LE mono PCM.
+_GREETING_SAMPLE_RATE = 24_000
+_GREETING_CACHE_PATH = Path("/tmp/agent_greeting.wav")
 
 
 @observe(as_type="generation", name="example_langfuse_step")
@@ -40,13 +57,62 @@ async def get_current_year() -> dict[str, int]:
         return result
 
 
+def _synthesize_greeting() -> Path:
+    """Generate the greeting WAV via Gemini standalone TTS. Cached on
+    disk so subsequent boots skip the API call."""
+    if _GREETING_CACHE_PATH.exists():
+        return _GREETING_CACHE_PATH
+    client = genai.Client()
+    response = client.models.generate_content(
+        model=_GREETING_TTS_MODEL,
+        contents=_GREETING_TEXT,
+        config=genai_types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=genai_types.SpeechConfig(
+                voice_config=genai_types.VoiceConfig(
+                    prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
+                        voice_name=_GREETING_VOICE,
+                    ),
+                ),
+            ),
+        ),
+    )
+    pcm = response.candidates[0].content.parts[0].inline_data.data
+    with wave.open(str(_GREETING_CACHE_PATH), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(_GREETING_SAMPLE_RATE)
+        f.writeframes(pcm)
+    logger.info("greeting WAV synthesized + cached", extra={"path": str(_GREETING_CACHE_PATH)})
+    return _GREETING_CACHE_PATH
+
+
+async def _wav_audio_frames(path: Path, frame_ms: int = 20) -> AsyncIterable[rtc.AudioFrame]:
+    with wave.open(str(path), "rb") as w:
+        sr = w.getframerate()
+        nch = w.getnchannels()
+        sw = w.getsampwidth()
+        samples_per_frame = sr * frame_ms // 1000
+        while True:
+            raw = w.readframes(samples_per_frame)
+            if not raw:
+                break
+            yield rtc.AudioFrame(
+                data=raw,
+                sample_rate=sr,
+                num_channels=nch,
+                samples_per_channel=len(raw) // (sw * nch),
+            )
+
+
 async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
     async with xray.attach(ctx, service_name="example-voice-agent") as xray_session:
+        model_id = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
         session = AgentSession(
             llm=google.realtime.RealtimeModel(
-                model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"),
-                voice="Puck",
+                model=model_id,
+                voice=_GREETING_VOICE,
                 output_audio_transcription=genai_types.AudioTranscriptionConfig(),
                 input_audio_transcription=genai_types.AudioTranscriptionConfig(),
             ),
@@ -71,28 +137,28 @@ async def entrypoint(ctx: JobContext) -> None:
             await session.start(
                 agent=Agent(
                     instructions=(
-                        "You are a friendly voice assistant. Greet the caller, then "
-                        "answer their question briefly in one or two sentences. "
-                        "If the caller asks about the current year (or any "
-                        "question whose answer depends on the current year), you "
-                        "MUST call the `get_current_year` tool and use its result."
+                        "You are a friendly voice assistant. You have already "
+                        "greeted the caller. Answer their question briefly in "
+                        "one or two sentences. If the caller asks about the "
+                        "current year (or any question whose answer depends on "
+                        "the current year), you MUST call the `get_current_year` "
+                        "tool and use its result."
                     ),
                     tools=[get_current_year],
                 ),
                 room=ctx.room,
             )
 
-            model_id = os.environ.get(
-                "GEMINI_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025"
-            )
+            greeting_wav = await asyncio.to_thread(_synthesize_greeting)
 
             with _tracer.start_as_current_span("xray.stage.tts") as span:
-                span.set_attribute("xray.stage.tts.provider", "gemini-live")
-                span.set_attribute("xray.stage.tts.model", model_id)
-                handle = session.generate_reply(
-                    instructions="Greet the caller in one short sentence."
+                span.set_attribute("xray.stage.tts.provider", "gemini-tts")
+                span.set_attribute("xray.stage.tts.model", _GREETING_TTS_MODEL)
+                await session.say(
+                    text=_GREETING_TEXT,
+                    audio=_wav_audio_frames(greeting_wav),
+                    allow_interruptions=False,
                 )
-                await handle
 
             _langfuse_step(model_id)
 
