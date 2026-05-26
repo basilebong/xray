@@ -31,7 +31,6 @@ type RenderState =
 
 export function TraceTree({ turns, spans, replayStartIso, zoom }: TraceTreeProps) {
 	const state = useMemo<RenderState>(() => {
-		if (spans.length === 0) return { kind: "empty" };
 		const { rows, scale } = buildTree(turns, spans, replayStartIso);
 		if (rows.length === 0) return { kind: "empty" };
 		return { kind: "ready", rows, scale };
@@ -534,7 +533,7 @@ function IndentGuides({ depth }: { depth: number }) {
 			style={{
 				width: `${depth * INDENT_PX}px`,
 				backgroundImage: `repeating-linear-gradient(to right, transparent 0, transparent ${INDENT_PX - 1}px, ${guideColor} ${INDENT_PX - 1}px, ${guideColor} ${INDENT_PX}px)`,
-				backgroundPosition: "18px 0",
+				backgroundPosition: `${INDENT_PX + 2}px 0`,
 				backgroundRepeat: "repeat-x",
 			}}
 		/>

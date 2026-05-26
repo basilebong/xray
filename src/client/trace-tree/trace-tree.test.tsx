@@ -61,6 +61,22 @@ describe("TraceTree", () => {
 		expect(screen.getByText(/No spans recorded/i)).toBeTruthy();
 	});
 
+	it("renders turn rows when turns exist but no spans were emitted", () => {
+		render(
+			<PlayerProvider>
+				<TraceTree
+					turns={[turn(0, "user", 0, 2_500), turn(1, "agent", 3_000, 6_500)]}
+					spans={[]}
+					replayStartIso={REPLAY_START}
+					zoom={1}
+				/>
+			</PlayerProvider>,
+		);
+		expect(screen.getByLabelText(/Seek to turn 1, user/i)).toBeTruthy();
+		expect(screen.getByLabelText(/Seek to turn 2, agent/i)).toBeTruthy();
+		expect(screen.queryByText(/No spans recorded/i)).toBeNull();
+	});
+
 	it("renders one row per turn and per attributed span", () => {
 		render(
 			<PlayerProvider>
