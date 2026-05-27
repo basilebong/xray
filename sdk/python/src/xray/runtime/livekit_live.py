@@ -163,20 +163,15 @@ class LiveKitLiveRuntime(Runtime):
         mic_task: asyncio.Task[None] | None = None
         agent_task: asyncio.Task[None] | None = None
         try:
-            try:
-                await asyncio.wait_for(agent_joined.wait(), timeout=self.agent_join_timeout_s)
-            except TimeoutError as e:
-                raise AgentNotJoinedError(self.room, self.agent_join_timeout_s) from e
-
-            audio_source = lk_rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
-            local_track = lk_rtc.LocalAudioTrack.create_audio_track("xray-user", audio_source)
-            publish_opts = lk_rtc.TrackPublishOptions()
-            publish_opts.source = lk_rtc.TrackSource.SOURCE_MICROPHONE
-            await room.local_participant.publish_track(local_track, publish_opts)
-
-            # Open the speaker first (its __aenter__ may raise
-            # SpeakerPlaybackError before any task exists). NullSpeaker when
-            # playback is disabled — keeps the rest of the flow uniform.
+            # Open the speaker and start consuming the agent's audio FIRST —
+            # before the mic setup. The agent emits its greeting the instant it
+            # joins; if we subscribe to its track late (after publishing our mic
+            # etc.) the opening of that greeting is clipped, because LiveKit's
+            # AudioStream only delivers frames from the moment of subscription.
+            # Starting the agent pump now means we attach the instant the track
+            # appears. (SpeakerSink.__aenter__ may raise SpeakerPlaybackError
+            # before any task exists; NullSpeaker keeps the flow uniform when
+            # playback is disabled.)
             speaker_cm: SpeakerSink = (
                 self._speaker_factory_or_default()(sample_rate=SAMPLE_RATE, channels=NUM_CHANNELS)
                 if self.play_agent_audio
@@ -188,9 +183,24 @@ class LiveKitLiveRuntime(Runtime):
                         lk_rtc, agent_track_holder, agent_track_event, agent_frames, speaker
                     )
                 )
-                # The mic factory can raise (e.g. LiveDependencyError when the
-                # [live] extra is missing); `agent_task` is already running, so
-                # the finally below owns its teardown.
+
+                # Confirm the agent actually joined (clear error if not). The
+                # agent pump above is already waiting to attach its track.
+                try:
+                    await asyncio.wait_for(agent_joined.wait(), timeout=self.agent_join_timeout_s)
+                except TimeoutError as e:
+                    raise AgentNotJoinedError(self.room, self.agent_join_timeout_s) from e
+
+                # Publish the mic + start capturing. The mic factory can raise
+                # (e.g. LiveDependencyError when the [live] extra is missing);
+                # agent_task is already running, so the finally below owns its
+                # teardown.
+                audio_source = lk_rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
+                local_track = lk_rtc.LocalAudioTrack.create_audio_track("xray-user", audio_source)
+                publish_opts = lk_rtc.TrackPublishOptions()
+                publish_opts.source = lk_rtc.TrackSource.SOURCE_MICROPHONE
+                await room.local_participant.publish_track(local_track, publish_opts)
+
                 mic_stream = self._mic_factory_or_default()(
                     sample_rate=SAMPLE_RATE, frame_samples=SAMPLES_PER_FRAME
                 )
@@ -218,6 +228,11 @@ class LiveKitLiveRuntime(Runtime):
                 await asyncio.gather(*pending, return_exceptions=True)
             await room.disconnect()
 
+        logger.info(
+            "live session captured %d user (mic) frames, %d agent frames",
+            len(user_frames),
+            len(agent_frames),
+        )
         mixdown_path = self._write_mixdown(user_frames, agent_frames)
         return RuntimeResult(
             responses=[],

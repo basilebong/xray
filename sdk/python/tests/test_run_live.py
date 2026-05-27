@@ -18,7 +18,7 @@ import respx
 from typing_extensions import override
 
 from xray import Conversation, ReplayResult, run_live
-from xray.errors import AgentNotJoinedError, ReplayEvaluationError
+from xray.errors import AgentNotJoinedError, AudioMissingError, ReplayEvaluationError
 from xray.runtime.base import Runtime, RuntimeResult
 
 _HASH = "a" * 64
@@ -226,6 +226,37 @@ async def test_run_live_driver_failure_patches_and_raises():
     assert body["failure_reason"] == "agent_not_joined"
     assert body["lifecycle_state"] == "failed"
     assert runtime.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_live_no_audio_captured_raises_audio_missing():
+    # Runtime returns no mixdown (zero frames captured). run_live must NOT
+    # POST /analyze on the still-`pending` replay (that yields an opaque 409);
+    # it raises a clear AudioMissingError and PATCHes the failure instead.
+    replay_id = "00000000-0000-0000-0000-0000000live5"
+    # assert_all_called=False: the analyze route is registered only to prove it
+    # is NOT hit, so respx must not require every route to be called.
+    with respx.mock(base_url="http://test.local", assert_all_called=False) as mock:
+        mock.post("/v1/conversations").mock(return_value=httpx.Response(200, json={"hash": _HASH}))
+        mock.post("/v1/replays").mock(
+            return_value=httpx.Response(201, json=_replay_response(replay_id))
+        )
+        patch = mock.patch(f"/v1/replays/{replay_id}").mock(
+            return_value=httpx.Response(200, json={})
+        )
+        analyze = mock.post(f"/v1/replays/{replay_id}/analyze").mock(
+            return_value=httpx.Response(202, json={"job_id": "j", "lifecycle_state": "analyzing"})
+        )
+
+        with pytest.raises(AudioMissingError):
+            await run_live(
+                runtime=StubLiveRuntime(full_audio_path=None), xray_url="http://test.local"
+            )
+
+    assert patch.called
+    assert not analyze.called  # never analyze an empty replay
+    body = json.loads(bytes(patch.calls.last.request.content).decode())
+    assert body["failure_reason"] == "audio_missing"
 
 
 @pytest.mark.asyncio

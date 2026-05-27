@@ -348,6 +348,18 @@ async def run_live(
                 logger.exception("audio upload errored on live replay %s", replay_id)
                 driver_error = XrayError(f"audio upload failed: {e}")
 
+        # No mixdown means the session captured zero audio (no mic frames AND no
+        # agent frames). Fail with a clear reason instead of POSTing /analyze on
+        # a still-`pending` replay, which the server rejects with an opaque 409.
+        if driver_error is None and (
+            runtime_result is None or runtime_result.full_audio_path is None
+        ):
+            driver_error = AudioMissingError(
+                "live session captured no audio — nothing to analyze. The microphone "
+                "produced no frames (check OS mic permission for your terminal/Python, and "
+                "that an input device is selected), or the session ended before any audio."
+            )
+
         if driver_error is not None:
             await _patch_driver_failure(client, replay_id, driver_error.failure_reason)
             raise driver_error
