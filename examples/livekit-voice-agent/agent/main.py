@@ -48,9 +48,6 @@ async def get_current_year() -> dict[str, int]:
         span.set_attribute("gen_ai.operation.name", "execute_tool")
         span.set_attribute("gen_ai.tool.name", "get_current_year")
         span.set_attribute("gen_ai.tool.arguments", "{}")
-        # Deliberately NOT the real year — a distinctive sentinel so that hearing
-        # the agent say "2011" proves the tool actually fired (vs the model
-        # answering the real year from its own knowledge).
         result = {"year": 2011}
         span.set_attribute("gen_ai.tool.result", json.dumps(result))
         return result

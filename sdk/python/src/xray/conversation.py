@@ -256,9 +256,7 @@ class Conversation:
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("Conversation.name must be non-empty")
-        # A live session's turns are observed at runtime, not scripted, so an
-        # empty turn list is valid only when live. The server enforces the
-        # same rule at the boundary.
+        # Live sessions have no script — empty turns are valid only when live.
         if len(self.turns) == 0 and not self.live:
             raise ValueError("Conversation must have at least one turn")
 

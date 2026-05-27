@@ -61,8 +61,7 @@ from xray.runtime.livekit import (
 
 logger = logging.getLogger(__name__)
 
-# A captured PCM frame tagged with the wall-clock second it was observed.
-# Used to place each frame at its true offset in the stereo mixdown.
+# A captured PCM frame tagged with the wall-clock second it arrived.
 TimedFrame = tuple[float, bytes]
 
 
