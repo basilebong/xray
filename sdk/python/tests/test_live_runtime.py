@@ -421,6 +421,17 @@ def test_write_live_mixdown_wall_clock_aligned(tmp_path: Path):
         assert w.getnframes() == SAMPLE_RATE
 
 
+def test_write_live_mixdown_bursts_laid_sequentially(tmp_path: Path):
+    # Three frames sharing one arrival timestamp = a decode burst. The old
+    # arrival-offset placement collapsed them onto the same samples (20ms of
+    # garbled overlap); sequential placement lays them back-to-back (60ms).
+    agent = [(0.0, _silence(20)), (0.0, _silence(20)), (0.0, _silence(20))]
+    out = tmp_path / "burst.wav"
+    write_live_mixdown(user_frames=[], agent_frames=agent, out_path=out)
+    with wave.open(str(out), "rb") as w:
+        assert w.getnframes() == SAMPLE_RATE * 60 // 1000
+
+
 def test_write_live_mixdown_empty(tmp_path: Path):
     out = tmp_path / "empty.wav"
     write_live_mixdown(user_frames=[], agent_frames=[], out_path=out)

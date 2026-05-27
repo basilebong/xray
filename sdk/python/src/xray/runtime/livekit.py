@@ -735,14 +735,22 @@ def write_live_mixdown(
     out_path: Path,
 ) -> None:
     """Write a wall-clock-aligned stereo WAV (L = user mic, R = agent) for a
-    live session. Each frame is ``(wall_clock_seconds, int16_pcm_bytes)``;
-    frames are placed at their offset from t0 (earliest frame across both
-    channels), so the gaps the agent's event-driven ``AudioStream`` leaves
-    during silence become real silence — not compressed-away time.
+    live session. Each frame is ``(wall_clock_seconds, int16_pcm_bytes)``.
 
-    Mirrors :func:`write_stereo_mixdown` but keyed on per-frame timestamps
-    instead of per-turn segments, because a live run has no turn boundaries
-    on the driver side (the server derives them via VAD from this file)."""
+    Within a channel, frames are laid **sequentially** — back-to-back — rather
+    than at each frame's raw arrival offset. LiveKit's ``AudioStream`` delivers
+    *consecutive* audio frames in bursts (decoded ahead of real time), so many
+    frames carry near-identical arrival timestamps; placing each at its arrival
+    offset collapses the burst onto overlapping samples and garbles the channel
+    (the bug that made replays sound distorted even though live playback, which
+    is sequential, was clean). Each frame therefore goes at
+    ``max(running_position, arrival_offset)``: a burst lays back-to-back with no
+    overlap, while a genuine arrival gap (arrival past the running position)
+    inserts silence so cross-channel timing — who spoke when — is preserved.
+
+    Mirrors :func:`write_stereo_mixdown` but keyed on per-frame arrival times
+    instead of per-turn segments, because a live run has no turn boundaries on
+    the driver side (the server derives them via VAD from this file)."""
     user = [(t, pcm) for t, pcm in user_frames if pcm]
     agent = [(t, pcm) for t, pcm in agent_frames if pcm]
     if not user and not agent:
@@ -753,18 +761,15 @@ def write_live_mixdown(
         return
 
     t0 = min(t for t, _pcm in [*user, *agent])
-    total_samples = 0
-    for t, pcm in [*user, *agent]:
-        offset_samples = max(0, int((t - t0) * SAMPLE_RATE))
-        total_samples = max(total_samples, offset_samples + len(pcm) // SAMPLE_WIDTH_BYTES)
+    user_placed, user_total = _place_live_frames(user, t0)
+    agent_placed, agent_total = _place_live_frames(agent, t0)
+    total_samples = max(user_total, agent_total)
 
     left = bytearray(total_samples * SAMPLE_WIDTH_BYTES)
     right = bytearray(total_samples * SAMPLE_WIDTH_BYTES)
-    for t, pcm in user:
-        offset_bytes = max(0, int((t - t0) * SAMPLE_RATE)) * SAMPLE_WIDTH_BYTES
+    for offset_bytes, pcm in user_placed:
         _mix_into(left, offset_bytes, bytearray(pcm))
-    for t, pcm in agent:
-        offset_bytes = max(0, int((t - t0) * SAMPLE_RATE)) * SAMPLE_WIDTH_BYTES
+    for offset_bytes, pcm in agent_placed:
         _mix_into(right, offset_bytes, bytearray(pcm))
 
     with wave.open(str(out_path), "wb") as w:
@@ -772,6 +777,22 @@ def write_live_mixdown(
         w.setsampwidth(SAMPLE_WIDTH_BYTES)
         w.setframerate(SAMPLE_RATE)
         w.writeframes(_interleave_lr(left=bytes(left), right=bytes(right)))
+
+
+def _place_live_frames(
+    frames: list[tuple[float, bytes]], t0: float
+) -> tuple[list[tuple[int, bytes]], int]:
+    """Compute byte offsets for one channel's frames, laying bursts
+    sequentially while honoring genuine arrival gaps. Returns the
+    ``(offset_bytes, pcm)`` placements and the channel's total sample count."""
+    placed: list[tuple[int, bytes]] = []
+    running_samples = 0
+    for t, pcm in frames:
+        arrival_samples = max(0, int((t - t0) * SAMPLE_RATE))
+        pos_samples = max(running_samples, arrival_samples)
+        placed.append((pos_samples * SAMPLE_WIDTH_BYTES, pcm))
+        running_samples = pos_samples + len(pcm) // SAMPLE_WIDTH_BYTES
+    return placed, running_samples
 
 
 def _mix_into(dest: bytearray, offset_bytes: int, src: bytearray) -> None:
