@@ -58,6 +58,7 @@ from xray.runtime.livekit import (
     mint_user_token,
     write_live_mixdown,
 )
+from xray.runtime.sip import SimulatedSipCall
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,10 @@ class LiveKitLiveRuntime(Runtime):
     play_agent_audio: bool = True
     cache_root: Path = field(default_factory=lambda: Path.home() / ".cache" / "xray-py")
     mixdown_dir: Path | None = None
+    # When set, the live driver joins as ``ParticipantKind.SIP`` carrying
+    # the configured ``sip.*`` attributes — useful for exploratory dialing
+    # against the agent's real SIP code path without a real phone call.
+    simulated_sip: SimulatedSipCall | None = None
 
     # Injection points for tests. None ⇒ load the real packages / devices.
     _lk_rtc: LkRtcModule | None = None
@@ -138,6 +143,7 @@ class LiveKitLiveRuntime(Runtime):
             identity=self.identity,
             replay_id=self.replay_id,
             conversation_hash=self.conversation_hash,
+            simulated_sip=self.simulated_sip,
         )
 
         room = lk_rtc.Room()
