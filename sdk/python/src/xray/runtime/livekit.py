@@ -594,9 +594,8 @@ def mint_user_token(
     replay context). Shared by the scripted and live runtimes.
 
     When ``simulated_sip`` is provided the token additionally declares
-    ``ParticipantKind.SIP`` and carries the ``sip.*`` attributes the agent's
-    production SIP path reads — letting a replay exercise that path
-    unchanged. See :class:`xray.runtime.sip.SimulatedSipCall`.
+    ``kind=sip`` plus the ``sip.*`` attributes — see
+    :class:`xray.runtime.sip.SimulatedSipCall`.
     """
     attributes = encode_attribute(replay_id=replay_id, conversation_hash=conversation_hash)
     if simulated_sip is not None:

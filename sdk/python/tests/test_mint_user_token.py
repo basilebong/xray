@@ -1,6 +1,5 @@
 """Tests for ``mint_user_token`` — the shared JWT minter for both the
-scripted and live LiveKit runtimes. Covers the backward-compat path (no
-``simulated_sip``) and the new SIP-simulation path."""
+scripted and live LiveKit runtimes."""
 
 from __future__ import annotations
 
@@ -43,7 +42,6 @@ def test_without_simulated_sip_no_kind_call_only_xray_attribute() -> None:
     )
     assert jwt == "fake-jwt"
     token.with_identity.assert_called_once_with("xray-driver")
-    # Only the xray attribute on the JWT.
     args, _ = token.with_attributes.call_args
     attrs = args[0]
     assert set(attrs.keys()) == {XRAY_ATTRIBUTE_KEY}
@@ -75,9 +73,8 @@ def test_simulated_sip_sets_kind_sip_and_merges_attrs() -> None:
 
     args, _ = token.with_attributes.call_args
     attrs = args[0]
-    # xray attribute still there (not clobbered).
+    # xray attribute must coexist with sip.* — the merge can't clobber it.
     assert XRAY_ATTRIBUTE_KEY in attrs
-    # sip.* attrs all present with the canonical keys.
     assert attrs["sip.phoneNumber"] == "+15551234567"
     assert attrs["sip.trunkPhoneNumber"] == "+46790952746"
     assert attrs["sip.callID"] == "abc-123"

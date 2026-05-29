@@ -12,16 +12,13 @@ participant, so the agent's existing SIP code path runs unchanged against
 a scripted replay or a live mic session — no SIP-bypass branch on the
 agent side.
 
-This dataclass carries each attribute as an optional field;
-:meth:`to_attributes` projects it to the wire dict
-:func:`xray.runtime.livekit.mint_user_token` merges alongside the ``xray``
-token attribute. Arbitrary additional keys — anything the agent reads that
-isn't in the standard ``sip.*`` set, including custom keys promoted via a
-trunk's ``headers_to_attributes`` map — live in ``extra_attrs``.
+Arbitrary additional keys — anything outside the standard ``sip.*`` set,
+including custom keys promoted via a trunk's ``headers_to_attributes``
+map — ride through ``extra_attrs``.
 
-Reference: https://docs.livekit.io/sip/sip-participant — canonical
-``sip.*`` attribute list. Casing matters (``sip.callID``, not
-``sip.callId``); ``to_attributes`` emits the docs spelling verbatim.
+Reference: https://docs.livekit.io/sip/sip-participant. Casing matters
+(``sip.callID``, not ``sip.callId``); ``to_attributes`` emits the docs
+spelling verbatim.
 """
 
 from __future__ import annotations
@@ -37,12 +34,10 @@ SipCallStatus: TypeAlias = Literal["active", "automation", "dialing", "hangup", 
 
 @dataclass(frozen=True)
 class SimulatedSipCall:
-    """Attributes the driver projects onto its JWT to appear as an inbound
-    SIP participant.
-
-    Every field is optional — populate only the attributes the agent under
-    test reads. An empty SimulatedSipCall is rejected at construction; pass
-    ``simulated_sip=None`` for a non-SIP run instead of an empty object.
+    """Every field is optional — populate only the attributes the agent
+    under test reads. An empty SimulatedSipCall is rejected at construction;
+    pass ``simulated_sip=None`` for a non-SIP run instead of an empty
+    object.
     """
 
     caller_phone: str | None = None
@@ -83,8 +78,6 @@ class SimulatedSipCall:
         )
 
     def to_attributes(self) -> dict[str, str]:
-        """Project to the ``sip.*`` dict the JWT carries. Keys match the
-        LiveKit SIP-participant docs exactly (casing included)."""
         attrs: dict[str, str] = {}
         if self.caller_phone is not None:
             attrs["sip.phoneNumber"] = self.caller_phone
