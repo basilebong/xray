@@ -29,8 +29,11 @@ export type CalculateMetricsProcessor = (payload: JobPayload) => Promise<Calcula
 /**
  * Stage 2 of the analyze chain. Reads the VAD-derived turns + speech
  * segments + raw spans, computes per-turn timing metrics, writes
- * `replay_metrics`, transitions analysis_step to `evaluate`, then
- * enqueues `evaluate-replay`.
+ * `replay_metrics`. For a scripted replay it then bumps analysis_step to
+ * `metrics` and enqueues `evaluate-replay`. For a live replay there's no
+ * script to evaluate, so this stage is terminal: it finalizes in the same
+ * transaction (writes an empty `replay_evaluations` row + flips lifecycle
+ * to `completed`) and emits `evaluation_complete` directly.
  *
  * Metrics computed:
  * - `agentResponseMs` (agent turns only): gap from the prior user turn's
@@ -85,7 +88,6 @@ export function makeCalculateMetricsProcessor(
 			// failure with full context.
 			const spec = getConversationSpec(store, replay.conversationHash);
 			const isLive = spec?.live ?? false;
-			const evaluatedAt = new Date().toISOString();
 
 			const advanced = store.db.transaction((tx) => {
 				// Same idempotency rule as every chain stage: don't trash
@@ -105,6 +107,9 @@ export function makeCalculateMetricsProcessor(
 					// would leave a crash window where the replay sits forever
 					// at `analyzing` (no chained evaluate-replay job to retry
 					// it). Single tx eliminates that window entirely.
+					// Captured inside the tx so the stored timestamp matches the
+					// moment this row flips to `completed`, not a few ms earlier.
+					const evaluatedAt = new Date().toISOString();
 					tx.delete(replayEvaluations).where(eq(replayEvaluations.replayId, replayId)).run();
 					tx.insert(replayEvaluations)
 						.values({

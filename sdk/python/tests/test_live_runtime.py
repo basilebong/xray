@@ -380,24 +380,40 @@ async def test_agent_audio_timeout_independent_of_join_timeout(tmp_path: Path):
     """``agent_join_timeout_s`` gates the participant-join wait; the
     distinct ``agent_audio_timeout_s`` gates the audio-publish wait. An
     operator must be able to tune them independently — same field for both
-    would surprise anyone shortening the join timeout for a fast-fail."""
-    # Agent joins immediately but never publishes audio. With a fast
-    # audio timeout, the agent pump returns cleanly; the user-only
-    # recording is finalized.
-    rtc = _build_fake_lk_rtc(staged_events=[_stage_agent_join()])
+    would surprise anyone shortening the join timeout for a fast-fail.
+
+    The discriminator: a 0 s audio timeout against a 30 s join timeout, with
+    the agent publishing its track only *after* the pump should have given
+    up. If the audio wait were (wrongly) governed by ``agent_join_timeout_s``
+    the pump would still be listening 50 ms in and would record + play the
+    late track. Asserting the late track is NOT played is what proves the
+    audio wait used the short, independent knob — a regression to the join
+    timeout flips the assertion."""
+    rtc = _build_fake_lk_rtc(staged_events=[_stage_agent_join()])  # joins, no track yet
     api = _build_fake_lk_api()
-    rt = _runtime(tmp_path, rtc, api, mic_frames=[_silence(20)])
+    speaker = _FakeSpeaker()
+    rt = _runtime(tmp_path, rtc, api, mic_frames=[_silence(20)], speaker=speaker)
     rt.agent_join_timeout_s = 30.0  # generous join timeout
-    rt.agent_audio_timeout_s = 0.05  # snappy audio timeout
+    rt.agent_audio_timeout_s = 0.0  # audio wait gives up on the first tick
     conv = Conversation(name="live", turns=[], live=True)
 
     task = asyncio.create_task(rt.run(conv))
-    # Let the audio-timeout fire (50 ms) and the agent pump return.
-    await asyncio.sleep(0.1)
+    # The 0 s audio timeout fires and the agent pump returns before this
+    # returns; 50 ms is far longer than the single loop tick it needs.
+    await asyncio.sleep(0.05)
+    # Agent publishes audio only NOW, after the pump already gave up. A pump
+    # still bound to the 30 s join timeout would catch this and record it.
+    track_event, track_args = _stage_agent_track([_silence(20), _silence(20)])
+    rtc.Room.rooms[0].fire(track_event, *track_args)
+    await asyncio.sleep(0.05)
+
     rt.request_stop()
     result = await asyncio.wait_for(task, timeout=3.0)
     # User-only recording finalized cleanly; no AgentNotJoinedError.
     assert result.full_audio_path is not None
+    # The late agent track was ignored — the audio wait used the 0 s knob,
+    # not the 30 s join timeout.
+    assert speaker.played == []
 
 
 @pytest.mark.asyncio
